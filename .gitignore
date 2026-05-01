@@ -216,3 +216,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# AWS SAM build artifacts
+.aws-sam/
+samconfig.local.toml
+
+# uv
+.venv/
