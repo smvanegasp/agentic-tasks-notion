@@ -135,7 +135,7 @@ Implementation lands in stages. The agreed sequence:
 2. ✅ **Notion layer** — `notion_io/client.py`, `tasks.py`, `projects.py`. 13 tests, all mocked. `scripts/notion_smoke.py` exercises the real DB read-only.
 3. ✅ **Agent layer** — `agent/loop.py`, `tools.py`, `prompts.py`. 15 tests, mocked. `scripts/agent_repl.py` for interactive end-to-end testing.
 4. ✅ **Telegram layer** — `telegram_io/dispatcher.py` (shared) + `telegram_io/auth.py` + `handlers/webhook.py` (Lambda). 10 tests, mocked. `scripts/telegram_local.py` runs the bot via long-polling for local testing — no public URL required.
-5. **Digest layer** — `digest/render.py` and `handlers/digest.py`.
+5. ✅ **Digest layer** — `digest/render.py` (pure formatter, 12 tests) + `handlers/digest.py` (Lambda handler, 3 tests). `scripts/digest_local.py` previews/sends the digest locally with `--dry-run` and `--date` flags. No LLM call — deterministic and free to run.
 6. **SAM template** — `template.yaml` with both Lambdas, EventBridge cron, Secrets Manager wiring, parameters for `DIGEST_TIME`, `TIMEZONE`, `OPENAI_MODEL`.
 7. **Deploy + register webhook** — first AWS deploy; `scripts/set_webhook.py` points Telegram at the API Gateway URL.
 8. **README polish** — fork-and-deploy instructions for public users.

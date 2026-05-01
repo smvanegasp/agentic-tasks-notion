@@ -124,6 +124,37 @@ def query_today(today: date | None = None) -> list[Task]:
     )
 
 
+def query_due_today(today: date | None = None) -> list[Task]:
+    """Tasks due today only (not My Day), status != Done."""
+    today = today or date.today()
+    return query_tasks(
+        filter_={
+            "and": [
+                {
+                    "property": TaskProperty.STATUS,
+                    "status": {"does_not_equal": Status.DONE.value},
+                },
+                {"property": TaskProperty.DUE, "date": {"equals": today.isoformat()}},
+            ]
+        },
+    )
+
+
+def query_my_day() -> list[Task]:
+    """Tasks flagged ``My Day``, status != Done. Independent of due date."""
+    return query_tasks(
+        filter_={
+            "and": [
+                {
+                    "property": TaskProperty.STATUS,
+                    "status": {"does_not_equal": Status.DONE.value},
+                },
+                {"property": TaskProperty.MY_DAY, "checkbox": {"equals": True}},
+            ]
+        },
+    )
+
+
 def query_overdue(today: date | None = None) -> list[Task]:
     """Tasks with `Due` < today, status != Done."""
     today = today or date.today()
