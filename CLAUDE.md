@@ -140,14 +140,76 @@ Implementation lands in stages. The agreed sequence:
 7. **Deploy + register webhook** — first AWS deploy; `scripts/set_webhook.py` points Telegram at the API Gateway URL.
 8. **README polish** — fork-and-deploy instructions for public users.
 
+## Tool layer: Pydantic + OpenAI SDK helper
+
+Tool argument shapes are declared as Pydantic `BaseModel` classes in
+`src/agentic_tasks/agent/tools.py`. Schemas exposed to the LLM are generated
+from those models via `openai.pydantic_function_tool()` (built into the
+OpenAI SDK) — do not hand-roll JSON schemas. Incoming tool-call arguments are
+validated against the same model in `call_tool()` before dispatching to the
+implementation, so a malformed call from the model returns a clean error
+instead of crashing the loop.
+
+`pydantic_function_tool` produces strict-mode schemas (all fields required,
+optionals as `anyOf [type, null]`, `additionalProperties: false`). Both
+OpenAI and Groq honor this. Adding a new tool: define a `BaseModel`, add it
+to the `_TOOLS` mapping, and both schema and dispatch pick it up.
+
+## Tool messages: Harmony compatibility
+
+Groq's `gpt-oss-*` models tokenize via Harmony, which **requires** a `name`
+field on every `tool` role message — OpenAI treats it as optional. Always set
+`name` to the function name when constructing tool messages (see
+`agent/loop.py`). Persisted conversation history that omits this will crash
+on replay with `HarmonyError: Tools should have a name!`.
+
+## Confirmation gate (write tools)
+
+Every write tool (`create_task`, `update_task`, `complete_task`) is gated by
+a code-enforced y/n confirmation flow — the loop will **not** execute these
+in the same turn the model emits them. This is a structural guard, not a
+prompt rule, so the model cannot bypass it.
+
+Flow:
+
+1. Model emits a write tool call. `agent/loop.py` detects it
+   (`WRITE_TOOL_NAMES` from `agent/preview.py`), short-circuits the round,
+   builds a deterministic preview via `preview.format_preview`, and returns
+   `(preview_text, agent_messages, pending_plan)`. The pending plan is a
+   list of `{"tool": str, "arguments": dict}` entries.
+2. Dispatcher persists the plan via `ConversationStore.set_pending_plan`
+   (DynamoDB field `pending_plan` on the same conversation row).
+3. On the next user message, the dispatcher consults `get_pending_plan`
+   **before** running the agent:
+   - `is_confirmation` matches → call `preview.execute_plan(plan)`, clear
+     pending state, send the deterministic summary (which includes
+     `<a href="...">open</a>` links to created/updated tasks).
+   - `is_rejection` matches → clear pending, reply "What would you like to
+     change?" and wait for feedback.
+   - Anything else → clear pending and run the agent normally; the prior
+     preview is in history so the model can re-propose.
+
+If the model also emitted read tool calls in the same round as a write,
+**all of them are dropped** — the model can re-issue reads on the next
+turn. This keeps the persisted conversation history free of orphan tool
+calls.
+
+`/reset` is a literal-text early route in the dispatcher that calls
+`store.reset(chat_id)` (clears history and any pending plan).
+
+When adding new write-style tools: also add them to `WRITE_TOOL_NAMES` in
+`agent/preview.py` AND extend the dispatch branches in
+`preview.execute_plan` and `preview.format_preview`.
+
 ## Things that are deliberately NOT in this project
 
 - No multi-user support. Single-user only by design.
 - No conversation memory across Telegram messages (each message is a fresh
   agent turn, with state reconstructed from Notion as needed).
 - No recurring task creation logic — Notion's template handles recurrence.
-- No framework on top of the OpenAI SDK (no LangChain, etc.). Tool calling is
-  used directly.
+- No third-party agent frameworks (CrewAI, LangChain, OpenAI Agents SDK,
+  etc.). The project stays at the OpenAI SDK layer — Pydantic + the SDK's
+  built-in `pydantic_function_tool` helper is the supported pattern.
 
 ## Reference: prior art
 

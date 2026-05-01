@@ -9,6 +9,7 @@ dependencies = [
     "python-telegram-bot>=21,<22",
     "notion-client>=2.2",
     "openai>=1.40",
+    "pydantic>=2.7",
     "rapidfuzz>=3.9",
     "python-dateutil>=2.9",
     "tzdata>=2024.1",

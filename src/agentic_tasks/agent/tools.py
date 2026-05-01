@@ -1,7 +1,13 @@
-"""Agent tools: OpenAI function-calling schemas and a dispatcher to local code.
+"""Agent tools: Pydantic-backed function-calling schemas and a dispatcher.
 
-Adding a new tool: append a schema to ``TOOL_SCHEMAS`` and a callable to
-``DISPATCH``. Each tool returns a JSON string suitable for the model.
+Tool argument shapes are declared as Pydantic models. The OpenAI SDK helper
+``openai.pydantic_function_tool()`` converts each model into a strict tool
+schema that the LLM sees, and ``call_tool`` validates incoming JSON arguments
+against the same model before dispatching to the underlying implementation.
+
+Adding a new tool: define a ``BaseModel`` for its arguments, add an entry to
+``_TOOLS`` mapping the tool name to (model, implementation, description), and
+both the schema and the dispatcher pick it up automatically.
 """
 
 from __future__ import annotations
@@ -10,7 +16,11 @@ import json
 import logging
 from datetime import date, datetime
 from time import perf_counter
-from typing import Any
+from typing import Any, Literal
+
+from openai.types.chat import ChatCompletionFunctionToolParam
+from pydantic import BaseModel, Field, ValidationError
+from rapidfuzz import fuzz, process
 
 from agentic_tasks.config import get_settings
 from agentic_tasks.notion_io.projects import find_project_by_name, list_projects
@@ -26,6 +36,9 @@ from agentic_tasks.notion_io.tasks import (
 log = logging.getLogger(__name__)
 
 _PRIORITY_RANK = {"High": 0, "Medium": 1, "Low": 2}
+
+StatusLiteral = Literal["To Do", "Doing", "Done"]
+PriorityLiteral = Literal["Low", "Medium", "High"]
 
 
 def _task_to_dict(t: Task) -> dict:
@@ -66,44 +79,147 @@ def _parse_iso_date(value: str) -> date | datetime:
     return dt
 
 
-def _query_tasks_tool(
-    *,
-    status: str | None = None,
-    include_done: bool = False,
-    due_on: str | None = None,
-    due_on_or_after: str | None = None,
-    due_on_or_before: str | None = None,
-    my_day: bool | None = None,
-    project_name: str | None = None,
-    limit: int = 25,
-) -> str:
+# ---- Pydantic argument models ----------------------------------------------
+
+
+class QueryTasksArgs(BaseModel):
+    """Query tasks from the user's Notion to-do database. By default excludes
+    completed tasks. Use due_on for a specific date and due_on_or_after /
+    due_on_or_before for ranges — compute concrete YYYY-MM-DD dates from the
+    user's words yourself."""
+
+    status: StatusLiteral | None = None
+    include_done: bool = Field(
+        False,
+        description=(
+            "Set true to also include completed tasks. Default false — done"
+            " tasks are filtered out."
+        ),
+    )
+    due_on: str | None = Field(
+        None,
+        description=(
+            "Match tasks whose Due date equals this YYYY-MM-DD. Use for"
+            " queries like 'tomorrow' or a specific day."
+        ),
+    )
+    due_on_or_after: str | None = Field(
+        None,
+        description=(
+            "Match tasks whose Due date is on or after this YYYY-MM-DD."
+            " Combine with due_on_or_before for ranges."
+        ),
+    )
+    due_on_or_before: str | None = Field(
+        None,
+        description="Match tasks whose Due date is on or before this YYYY-MM-DD.",
+    )
+    my_day: bool | None = Field(None, description="Only tasks marked 'My Day'.")
+    project_name: str | None = Field(
+        None, description="Filter by project (fuzzy matched)."
+    )
+    limit: int = 25
+
+
+class FindTasksArgs(BaseModel):
+    """Fuzzy-search for open tasks by partial name, acronym, or keyword.
+
+    Use this BEFORE update_task / complete_task whenever the user references
+    a task by less than its full name (e.g., 'APD task', 'the doctor
+    appointment', 'cinema'). Returns the best matches with their page_ids
+    so you can act on the right one without guessing from earlier
+    conversation history.
+    """
+
+    name_query: str = Field(
+        ..., description="Text the user used to refer to the task."
+    )
+    include_done: bool = Field(
+        False, description="Set true to also search completed tasks."
+    )
+    limit: int = Field(5, description="Maximum number of matches to return.")
+
+
+class CreateTaskArgs(BaseModel):
+    """Create a new task in Notion."""
+
+    name: str
+    description: str | None = None
+    due: str | None = Field(
+        None,
+        description=(
+            "ISO 8601 date (YYYY-MM-DD) or datetime "
+            "(YYYY-MM-DDTHH:MM:SS with optional offset)."
+        ),
+    )
+    priority: PriorityLiteral | None = None
+    project_name: str | None = Field(
+        None, description="Project to attach (fuzzy matched)."
+    )
+    labels: list[str] | None = None
+    my_day: bool = False
+
+
+class UpdateTaskArgs(BaseModel):
+    """Update fields on an existing task. Only provided fields change. Pass an
+    empty string for 'due' to clear it."""
+
+    page_id: str
+    name: str | None = None
+    description: str | None = None
+    due: str | None = None
+    priority: PriorityLiteral | None = None
+    status: StatusLiteral | None = None
+    project_name: str | None = None
+    labels: list[str] | None = None
+    my_day: bool | None = None
+
+
+class CompleteTaskArgs(BaseModel):
+    """Mark a task as Done."""
+
+    page_id: str
+
+
+class ListProjectsArgs(BaseModel):
+    """List every project in the projects DB (for disambiguation)."""
+
+
+# ---- Tool implementations --------------------------------------------------
+
+
+def _query_tasks_tool(args: QueryTasksArgs) -> str:
     conditions: list[dict] = []
 
-    if status:
-        conditions.append({"property": TaskProperty.STATUS, "status": {"equals": status}})
-    elif not include_done:
+    if args.status:
+        conditions.append(
+            {"property": TaskProperty.STATUS, "status": {"equals": args.status}}
+        )
+    elif not args.include_done:
         conditions.append(
             {"property": TaskProperty.STATUS, "status": {"does_not_equal": "Done"}}
         )
 
-    if due_on:
-        conditions.append({"property": TaskProperty.DUE, "date": {"equals": due_on}})
-    if due_on_or_after:
+    if args.due_on:
+        conditions.append({"property": TaskProperty.DUE, "date": {"equals": args.due_on}})
+    if args.due_on_or_after:
         conditions.append(
-            {"property": TaskProperty.DUE, "date": {"on_or_after": due_on_or_after}}
+            {"property": TaskProperty.DUE, "date": {"on_or_after": args.due_on_or_after}}
         )
-    if due_on_or_before:
+    if args.due_on_or_before:
         conditions.append(
-            {"property": TaskProperty.DUE, "date": {"on_or_before": due_on_or_before}}
+            {"property": TaskProperty.DUE, "date": {"on_or_before": args.due_on_or_before}}
         )
 
-    if my_day is True:
+    if args.my_day is True:
         conditions.append({"property": TaskProperty.MY_DAY, "checkbox": {"equals": True}})
 
-    if project_name:
-        proj = find_project_by_name(project_name)
+    if args.project_name:
+        proj = find_project_by_name(args.project_name)
         if proj is None:
-            return json.dumps({"error": f"No project matching '{project_name}'.", "tasks": []})
+            return json.dumps(
+                {"error": f"No project matching '{args.project_name}'.", "tasks": []}
+            )
         conditions.append(
             {"property": TaskProperty.PROJECT, "relation": {"contains": proj.page_id}}
         )
@@ -116,254 +232,165 @@ def _query_tasks_tool(
     else:
         filter_ = {"and": conditions}
 
-    tasks = _sort_tasks(query_tasks(filter_=filter_, page_size=limit))
+    tasks = _sort_tasks(query_tasks(filter_=filter_, page_size=args.limit))
     return json.dumps({"tasks": [_task_to_dict(t) for t in tasks]})
 
 
-def _create_task_tool(
-    *,
-    name: str,
-    description: str | None = None,
-    due: str | None = None,
-    priority: str | None = None,
-    project_name: str | None = None,
-    labels: list[str] | None = None,
-    my_day: bool = False,
-) -> str:
-    parsed_due = _parse_iso_date(due) if due else None
-    parsed_priority = Priority(priority) if priority else None
+# rapidfuzz partial_ratio cutoff for find_tasks. Below this, matches are
+# usually noise (substrings happen to overlap). 60 catches acronyms like
+# "APD" matching "Respond to the offer from APD" (which scores 100).
+_FIND_TASKS_SCORE_CUTOFF = 60
+
+
+def _find_tasks_tool(args: FindTasksArgs) -> str:
+    if not args.name_query.strip():
+        return json.dumps({"error": "name_query is empty.", "tasks": []})
+
+    filter_: dict | None = None
+    if not args.include_done:
+        filter_ = {
+            "property": TaskProperty.STATUS,
+            "status": {"does_not_equal": "Done"},
+        }
+    candidates = query_tasks(filter_=filter_, page_size=200)
+
+    by_name: dict[str, Task] = {}
+    for t in candidates:
+        if t.name and t.name not in by_name:
+            by_name[t.name] = t
+    if not by_name:
+        return json.dumps({"tasks": []})
+
+    matches = process.extract(
+        args.name_query,
+        list(by_name.keys()),
+        scorer=fuzz.partial_ratio,
+        limit=args.limit,
+        score_cutoff=_FIND_TASKS_SCORE_CUTOFF,
+    )
+    matched = [by_name[name] for name, _score, _i in matches]
+    return json.dumps({"tasks": [_task_to_dict(t) for t in matched]})
+
+
+def _create_task_tool(args: CreateTaskArgs) -> str:
+    parsed_due = _parse_iso_date(args.due) if args.due else None
+    parsed_priority = Priority(args.priority) if args.priority else None
 
     project_ids: list[str] | None = None
-    if project_name:
-        proj = find_project_by_name(project_name)
+    if args.project_name:
+        proj = find_project_by_name(args.project_name)
         if proj is None:
-            return json.dumps({"error": f"No project matching '{project_name}'."})
+            return json.dumps({"error": f"No project matching '{args.project_name}'."})
         project_ids = [proj.page_id]
 
     task = create_task(
-        name=name,
-        description=description,
+        name=args.name,
+        description=args.description,
         due=parsed_due,
         priority=parsed_priority,
         project_ids=project_ids,
-        labels=labels,
-        my_day=my_day,
+        labels=args.labels,
+        my_day=args.my_day,
     )
     return json.dumps({"created": _task_to_dict(task)})
 
 
-def _update_task_tool(
-    *,
-    page_id: str,
-    name: str | None = None,
-    description: str | None = None,
-    due: str | None = None,
-    priority: str | None = None,
-    status: str | None = None,
-    project_name: str | None = None,
-    labels: list[str] | None = None,
-    my_day: bool | None = None,
-) -> str:
+def _update_task_tool(args: UpdateTaskArgs) -> str:
     kwargs: dict[str, Any] = {}
-    if name is not None:
-        kwargs["name"] = name
-    if description is not None:
-        kwargs["description"] = description
-    if due is not None:
-        kwargs["due"] = None if due == "" else _parse_iso_date(due)
-    if priority is not None:
-        kwargs["priority"] = Priority(priority)
-    if status is not None:
-        kwargs["status"] = Status(status)
-    if project_name is not None:
-        proj = find_project_by_name(project_name)
+    if args.name is not None:
+        kwargs["name"] = args.name
+    if args.description is not None:
+        kwargs["description"] = args.description
+    if args.due is not None:
+        kwargs["due"] = None if args.due == "" else _parse_iso_date(args.due)
+    if args.priority is not None:
+        kwargs["priority"] = Priority(args.priority)
+    if args.status is not None:
+        kwargs["status"] = Status(args.status)
+    if args.project_name is not None:
+        proj = find_project_by_name(args.project_name)
         if proj is None:
-            return json.dumps({"error": f"No project matching '{project_name}'."})
+            return json.dumps({"error": f"No project matching '{args.project_name}'."})
         kwargs["project_ids"] = [proj.page_id]
-    if labels is not None:
-        kwargs["labels"] = labels
-    if my_day is not None:
-        kwargs["my_day"] = my_day
+    if args.labels is not None:
+        kwargs["labels"] = args.labels
+    if args.my_day is not None:
+        kwargs["my_day"] = args.my_day
 
-    task = update_task(page_id, **kwargs)
+    task = update_task(args.page_id, **kwargs)
     return json.dumps({"updated": _task_to_dict(task)})
 
 
-def _complete_task_tool(*, page_id: str) -> str:
-    task = complete_task(page_id)
+def _complete_task_tool(args: CompleteTaskArgs) -> str:
+    task = complete_task(args.page_id)
     return json.dumps({"completed": _task_to_dict(task)})
 
 
-def _list_projects_tool() -> str:
+def _list_projects_tool(_args: ListProjectsArgs) -> str:
     projects = list_projects()
     return json.dumps(
         {"projects": [{"id": p.page_id, "name": p.name} for p in projects]}
     )
 
 
-TOOL_SCHEMAS: list[dict] = [
-    {
-        "type": "function",
-        "function": {
-            "name": "query_tasks",
-            "description": (
-                "Query tasks from the user's Notion to-do database. By default"
-                " excludes completed tasks. Use due_on for a specific date and"
-                " due_on_or_after / due_on_or_before for ranges — compute"
-                " concrete YYYY-MM-DD dates from the user's words yourself."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "status": {
-                        "type": "string",
-                        "enum": ["To Do", "Doing", "Done"],
-                    },
-                    "include_done": {
-                        "type": "boolean",
-                        "description": (
-                            "Set true to also include completed tasks. Default"
-                            " false — done tasks are filtered out."
-                        ),
-                    },
-                    "due_on": {
-                        "type": "string",
-                        "description": (
-                            "Match tasks whose Due date equals this YYYY-MM-DD."
-                            " Use for queries like 'tomorrow' or a specific day."
-                        ),
-                    },
-                    "due_on_or_after": {
-                        "type": "string",
-                        "description": (
-                            "Match tasks whose Due date is on or after this"
-                            " YYYY-MM-DD. Combine with due_on_or_before for"
-                            " ranges."
-                        ),
-                    },
-                    "due_on_or_before": {
-                        "type": "string",
-                        "description": (
-                            "Match tasks whose Due date is on or before this"
-                            " YYYY-MM-DD."
-                        ),
-                    },
-                    "my_day": {
-                        "type": "boolean",
-                        "description": "Only tasks marked 'My Day'.",
-                    },
-                    "project_name": {
-                        "type": "string",
-                        "description": "Filter by project (fuzzy matched).",
-                    },
-                    "limit": {"type": "integer", "default": 25},
-                },
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "create_task",
-            "description": "Create a new task in Notion.",
-            "parameters": {
-                "type": "object",
-                "required": ["name"],
-                "properties": {
-                    "name": {"type": "string"},
-                    "description": {"type": "string"},
-                    "due": {
-                        "type": "string",
-                        "description": (
-                            "ISO 8601 date (YYYY-MM-DD) or datetime "
-                            "(YYYY-MM-DDTHH:MM:SS with optional offset)."
-                        ),
-                    },
-                    "priority": {
-                        "type": "string",
-                        "enum": ["Low", "Medium", "High"],
-                    },
-                    "project_name": {
-                        "type": "string",
-                        "description": "Project to attach (fuzzy matched).",
-                    },
-                    "labels": {"type": "array", "items": {"type": "string"}},
-                    "my_day": {"type": "boolean"},
-                },
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "update_task",
-            "description": (
-                "Update fields on an existing task. Only provided fields "
-                "change. Pass an empty string for 'due' to clear it."
-            ),
-            "parameters": {
-                "type": "object",
-                "required": ["page_id"],
-                "properties": {
-                    "page_id": {"type": "string"},
-                    "name": {"type": "string"},
-                    "description": {"type": "string"},
-                    "due": {"type": "string"},
-                    "priority": {
-                        "type": "string",
-                        "enum": ["Low", "Medium", "High"],
-                    },
-                    "status": {
-                        "type": "string",
-                        "enum": ["To Do", "Doing", "Done"],
-                    },
-                    "project_name": {"type": "string"},
-                    "labels": {"type": "array", "items": {"type": "string"}},
-                    "my_day": {"type": "boolean"},
-                },
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "complete_task",
-            "description": "Mark a task as Done.",
-            "parameters": {
-                "type": "object",
-                "required": ["page_id"],
-                "properties": {"page_id": {"type": "string"}},
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_projects",
-            "description": "List every project in the projects DB (for disambiguation).",
-            "parameters": {"type": "object", "properties": {}},
-        },
-    },
+# ---- Schema + dispatch wiring ----------------------------------------------
+
+_TOOLS: dict[str, tuple[type[BaseModel], Any]] = {
+    "query_tasks": (QueryTasksArgs, _query_tasks_tool),
+    "find_tasks": (FindTasksArgs, _find_tasks_tool),
+    "create_task": (CreateTaskArgs, _create_task_tool),
+    "update_task": (UpdateTaskArgs, _update_task_tool),
+    "complete_task": (CompleteTaskArgs, _complete_task_tool),
+    "list_projects": (ListProjectsArgs, _list_projects_tool),
+}
+
+def _build_tool_schema(
+    model: type[BaseModel], tool_name: str
+) -> ChatCompletionFunctionToolParam:
+    """Build a tool schema directly from a Pydantic model — non-strict.
+
+    We deliberately do NOT use ``openai.pydantic_function_tool`` because it
+    sets ``strict: True``, which forces every property (including optionals)
+    to be present in the model's emitted JSON. Groq's gpt-oss-120b
+    occasionally omits a single optional field, and strict mode turns that
+    into a hard 400 ``tool_use_failed`` error that crashes the turn.
+
+    Non-strict schemas let the model emit only the fields it cares about;
+    Pydantic in :func:`call_tool` still validates and applies defaults, so
+    we keep the safety without the brittleness.
+    """
+    schema: dict[str, Any] = model.model_json_schema()
+    schema.pop("title", None)
+    function: dict[str, Any] = {"name": tool_name, "parameters": schema}
+    description = (model.__doc__ or "").strip()
+    if description:
+        function["description"] = description
+    return {"type": "function", "function": function}  # type: ignore[typeddict-item]
+
+
+TOOL_SCHEMAS: list[ChatCompletionFunctionToolParam] = [
+    _build_tool_schema(model, tool_name)
+    for tool_name, (model, _fn) in _TOOLS.items()
 ]
 
 
-DISPATCH: dict[str, Any] = {
-    "query_tasks": _query_tasks_tool,
-    "create_task": _create_task_tool,
-    "update_task": _update_task_tool,
-    "complete_task": _complete_task_tool,
-    "list_projects": _list_projects_tool,
-}
-
-
 def call_tool(name: str, arguments: dict) -> str:
-    """Dispatch a tool call. Returns a JSON string for the model."""
-    fn = DISPATCH.get(name)
-    if fn is None:
+    """Validate arguments against the tool's Pydantic model and dispatch.
+
+    Returns a JSON string suitable for the model.
+    """
+    entry = _TOOLS.get(name)
+    if entry is None:
         return json.dumps({"error": f"Unknown tool: {name}"})
+    model_cls, fn = entry
     start = perf_counter()
     try:
-        result = fn(**arguments)
+        args = model_cls.model_validate(arguments)
+    except ValidationError as e:
+        log.warning("tool %s arg validation failed: %s", name, e)
+        return json.dumps({"error": f"Invalid arguments for {name}: {e}"})
+    try:
+        result = fn(args)
     except Exception as e:  # noqa: BLE001
         log.warning(
             "tool %s failed in %.0fms: %s",

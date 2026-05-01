@@ -152,3 +152,54 @@ def test_factory_uses_in_memory_when_no_table_env(monkeypatch):
     get_store.cache_clear()
     store = get_store()
     assert isinstance(store, InMemoryConversationStore)
+
+
+def test_pending_plan_round_trip():
+    store, fake_table = _build_store()
+    plan = [{"tool": "create_task", "arguments": {"name": "X"}}]
+    store.set_pending_plan(1, plan)
+
+    assert store.get_pending_plan(1) == plan
+    assert "pending_plan" in fake_table.items[1]
+
+
+def test_pending_plan_clear_keeps_history():
+    store, fake_table = _build_store()
+    store.append(1, {"role": "user", "content": "hi"})
+    store.set_pending_plan(1, [{"tool": "create_task", "arguments": {"name": "X"}}])
+    store.clear_pending_plan(1)
+
+    assert store.get_pending_plan(1) is None
+    assert [m["content"] for m in store.get_history(1)] == ["hi"]
+
+
+def test_append_preserves_pending_plan():
+    """Appending messages must NOT clobber pending_plan."""
+    store, _ = _build_store()
+    plan = [{"tool": "create_task", "arguments": {"name": "X"}}]
+    store.set_pending_plan(1, plan)
+    store.append(1, {"role": "user", "content": "y"})
+
+    assert store.get_pending_plan(1) == plan
+
+
+def test_reset_clears_pending_plan():
+    store, _ = _build_store()
+    store.set_pending_plan(1, [{"tool": "create_task", "arguments": {"name": "X"}}])
+    store.reset(1)
+
+    assert store.get_pending_plan(1) is None
+
+
+def test_pending_plan_returns_none_when_stale():
+    """A pending plan from yesterday should not survive into today."""
+    store, fake_table = _build_store(today_iso="2026-05-01")
+    fake_table.items[1] = {
+        "chat_id": 1,
+        "messages": [],
+        "last_updated_date": "2026-04-30",
+        "ttl": 99999999999,
+        "pending_plan": [{"tool": "create_task", "arguments": {"name": "X"}}],
+    }
+
+    assert store.get_pending_plan(1) is None

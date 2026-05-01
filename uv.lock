@@ -13,6 +13,7 @@ source = { editable = "." }
 dependencies = [
     { name = "notion-client" },
     { name = "openai" },
+    { name = "pydantic" },
     { name = "python-dateutil" },
     { name = "python-telegram-bot" },
     { name = "rapidfuzz" },
@@ -34,6 +35,7 @@ dev = [
 requires-dist = [
     { name = "notion-client", specifier = ">=2.2" },
     { name = "openai", specifier = ">=1.40" },
+    { name = "pydantic", specifier = ">=2.7" },
     { name = "python-dateutil", specifier = ">=2.9" },
     { name = "python-telegram-bot", specifier = ">=21,<22" },
     { name = "rapidfuzz", specifier = ">=3.9" },

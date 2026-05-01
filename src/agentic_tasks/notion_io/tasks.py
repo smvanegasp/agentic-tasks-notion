@@ -80,6 +80,16 @@ def _parse_task(page: dict) -> Task:
     )
 
 
+def get_task(page_id: str) -> Task:
+    """Retrieve a single task by Notion page ID.
+
+    Used by the confirmation gate so previews can display the human-readable
+    task name for update / complete operations.
+    """
+    response: Any = get_client().pages.retrieve(page_id=page_id)
+    return _parse_task(response)
+
+
 def query_tasks(
     filter_: dict | None = None,
     sorts: list[dict] | None = None,

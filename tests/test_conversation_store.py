@@ -85,3 +85,51 @@ def test_reset_clears_history():
 def test_empty_chat_returns_empty_list():
     store = _store()
     assert store.get_history(999) == []
+
+
+def test_pending_plan_round_trip():
+    store = _store()
+    plan = [{"tool": "create_task", "arguments": {"name": "X"}}]
+    store.set_pending_plan(1, plan)
+
+    assert store.get_pending_plan(1) == plan
+
+
+def test_pending_plan_clear():
+    store = _store()
+    store.set_pending_plan(
+        1, [{"tool": "create_task", "arguments": {"name": "X"}}]
+    )
+    store.clear_pending_plan(1)
+
+    assert store.get_pending_plan(1) is None
+
+
+def test_pending_plan_isolated_per_chat():
+    store = _store()
+    store.set_pending_plan(1, [{"tool": "create_task", "arguments": {"name": "A"}}])
+
+    assert store.get_pending_plan(2) is None
+
+
+def test_reset_also_clears_pending_plan():
+    store = _store()
+    store.set_pending_plan(1, [{"tool": "create_task", "arguments": {"name": "X"}}])
+    store.reset(1)
+
+    assert store.get_pending_plan(1) is None
+
+
+def test_pending_plan_cleared_on_new_day():
+    times = [
+        datetime(2026, 4, 30, 23, 50, tzinfo=TZ),  # set_pending_plan
+        datetime(2026, 5, 1, 9, 0, tzinfo=TZ),  # append (which triggers _reset_if_new_day)
+        datetime(2026, 5, 1, 9, 0, tzinfo=TZ),  # get_pending_plan
+    ]
+    store = _store(clock_times=times)
+    store.append(1, _msg("yesterday"))  # so day-tracking is anchored
+    store.set_pending_plan(1, [{"tool": "create_task", "arguments": {"name": "X"}}])
+    # New day arrives — appending should drop both history and pending.
+    store.append(1, _msg("today"))
+
+    assert store.get_pending_plan(1) is None

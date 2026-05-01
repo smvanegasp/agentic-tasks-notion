@@ -40,6 +40,15 @@ class ConversationStore(Protocol):
     def append(self, chat_id: int, message: dict[str, Any]) -> None: ...
     def reset(self, chat_id: int) -> None: ...
 
+    # Pending-plan API powers the confirmation gate. A pending plan is a list
+    # of ``{"tool": str, "arguments": dict}`` entries that the agent loop
+    # deferred. The dispatcher consults this BEFORE running the agent on the
+    # next user message — y/yes executes it, n/no clears it, anything else
+    # clears it and treats the message as a new request.
+    def get_pending_plan(self, chat_id: int) -> list[dict[str, Any]] | None: ...
+    def set_pending_plan(self, chat_id: int, plan: list[dict[str, Any]]) -> None: ...
+    def clear_pending_plan(self, chat_id: int) -> None: ...
+
 
 @dataclass
 class _StoredTurn:
@@ -61,6 +70,7 @@ class InMemoryConversationStore:
         self._tz = tz
         self._clock = clock or (lambda: datetime.now(tz))
         self._data: dict[int, list[_StoredTurn]] = defaultdict(list)
+        self._pending: dict[int, list[dict[str, Any]]] = {}
 
     def get_history(self, chat_id: int) -> list[dict[str, Any]]:
         self._reset_if_new_day(chat_id)
@@ -74,6 +84,17 @@ class InMemoryConversationStore:
 
     def reset(self, chat_id: int) -> None:
         self._data[chat_id] = []
+        self._pending.pop(chat_id, None)
+
+    def get_pending_plan(self, chat_id: int) -> list[dict[str, Any]] | None:
+        self._reset_if_new_day(chat_id)
+        return self._pending.get(chat_id)
+
+    def set_pending_plan(self, chat_id: int, plan: list[dict[str, Any]]) -> None:
+        self._pending[chat_id] = plan
+
+    def clear_pending_plan(self, chat_id: int) -> None:
+        self._pending.pop(chat_id, None)
 
     def _reset_if_new_day(self, chat_id: int) -> None:
         turns = self._data.get(chat_id)
@@ -82,6 +103,7 @@ class InMemoryConversationStore:
         today = self._clock().date()
         if turns[-1].timestamp.date() != today:
             self._data[chat_id] = []
+            self._pending.pop(chat_id, None)
 
 
 class DynamoDBConversationStore:
@@ -107,33 +129,70 @@ class DynamoDBConversationStore:
     def _today_iso(self) -> str:
         return datetime.now(self._tz).date().isoformat()
 
-    def get_history(self, chat_id: int) -> list[dict[str, Any]]:
+    def _get_item(self, chat_id: int) -> dict[str, Any] | None:
         response = self._table.get_item(Key={"chat_id": chat_id})
         item = response.get("Item")
         if not item:
-            return []
+            return None
         if item.get("last_updated_date") != self._today_iso():
-            # Stale — return empty; the next append will overwrite with today's data.
+            # Stale — treat as missing; the next append will overwrite.
+            return None
+        return item
+
+    def get_history(self, chat_id: int) -> list[dict[str, Any]]:
+        item = self._get_item(chat_id)
+        if not item:
             return []
         return list(item.get("messages") or [])
 
     def append(self, chat_id: int, message: dict[str, Any]) -> None:
-        history = self.get_history(chat_id)
+        item = self._get_item(chat_id) or {}
+        history = list(item.get("messages") or [])
         history.append(message)
         if len(history) > self._max_messages:
             history = history[-self._max_messages :]
         ttl = int((datetime.now(self._tz) + timedelta(days=2)).timestamp())
-        self._table.put_item(
-            Item={
-                "chat_id": chat_id,
-                "messages": history,
-                "last_updated_date": self._today_iso(),
-                "ttl": ttl,
-            }
-        )
+        new_item: dict[str, Any] = {
+            "chat_id": chat_id,
+            "messages": history,
+            "last_updated_date": self._today_iso(),
+            "ttl": ttl,
+        }
+        # Preserve pending_plan across appends (cleared explicitly via the
+        # pending-plan API or by reset()).
+        if "pending_plan" in item:
+            new_item["pending_plan"] = item["pending_plan"]
+        self._table.put_item(Item=new_item)
 
     def reset(self, chat_id: int) -> None:
         self._table.delete_item(Key={"chat_id": chat_id})
+
+    def get_pending_plan(self, chat_id: int) -> list[dict[str, Any]] | None:
+        item = self._get_item(chat_id)
+        if not item:
+            return None
+        plan = item.get("pending_plan")
+        return list(plan) if plan else None
+
+    def set_pending_plan(self, chat_id: int, plan: list[dict[str, Any]]) -> None:
+        item = self._get_item(chat_id) or {}
+        ttl = int((datetime.now(self._tz) + timedelta(days=2)).timestamp())
+        self._table.put_item(
+            Item={
+                "chat_id": chat_id,
+                "messages": list(item.get("messages") or []),
+                "last_updated_date": self._today_iso(),
+                "ttl": ttl,
+                "pending_plan": plan,
+            }
+        )
+
+    def clear_pending_plan(self, chat_id: int) -> None:
+        item = self._get_item(chat_id)
+        if not item:
+            return
+        new_item = {k: v for k, v in item.items() if k != "pending_plan"}
+        self._table.put_item(Item=new_item)
 
 
 @lru_cache(maxsize=1)

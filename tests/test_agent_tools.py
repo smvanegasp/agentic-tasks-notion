@@ -207,6 +207,77 @@ def test_update_task_status_change(mock_update):
     assert mock_update.call_args.kwargs["status"].value == "Doing"
 
 
+@patch("agentic_tasks.agent.tools.query_tasks")
+def test_find_tasks_returns_acronym_match(mock_query):
+    """Sanity-check the user's reported case: 'APD' should match 'Respond to
+    the offer from APD' (rapidfuzz partial_ratio gives 100 for substring)."""
+    import json as _json
+
+    def make(name):
+        return Task(
+            page_id=f"id-{name}",
+            name=name,
+            status="To Do",
+            priority=None,
+            due=None,
+            project_ids=[],
+            labels=[],
+            description="",
+            my_day=False,
+            url="",
+        )
+
+    mock_query.return_value = [
+        make("Schedule the cinema"),
+        make("Respond to the offer from APD"),
+        make("go to the doctor"),
+    ]
+
+    result = _json.loads(call_tool("find_tasks", {"name_query": "APD"}))
+    names = [t["name"] for t in result["tasks"]]
+    assert names[0] == "Respond to the offer from APD"
+
+
+@patch("agentic_tasks.agent.tools.query_tasks")
+def test_find_tasks_returns_empty_below_threshold(mock_query):
+    import json as _json
+
+    def make(name):
+        return Task(
+            page_id=f"id-{name}",
+            name=name,
+            status="To Do",
+            priority=None,
+            due=None,
+        )
+
+    mock_query.return_value = [make("Buy markers"), make("Doctor appointment")]
+    result = _json.loads(call_tool("find_tasks", {"name_query": "xzqyx"}))
+    assert result["tasks"] == []
+
+
+@patch("agentic_tasks.agent.tools.query_tasks")
+def test_find_tasks_excludes_done_by_default(mock_query):
+    mock_query.return_value = []
+    call_tool("find_tasks", {"name_query": "anything"})
+
+    filter_ = mock_query.call_args.kwargs["filter_"]
+    assert filter_ == {"property": "Status", "status": {"does_not_equal": "Done"}}
+
+
+@patch("agentic_tasks.agent.tools.query_tasks")
+def test_find_tasks_includes_done_when_requested(mock_query):
+    mock_query.return_value = []
+    call_tool("find_tasks", {"name_query": "x", "include_done": True})
+
+    assert mock_query.call_args.kwargs["filter_"] is None
+
+
+def test_find_tasks_rejects_empty_query():
+    result = call_tool("find_tasks", {"name_query": "  "})
+    assert "error" in result
+
+
 def test_unknown_tool_returns_error():
     result = call_tool("does_not_exist", {})
     assert "Unknown tool" in result

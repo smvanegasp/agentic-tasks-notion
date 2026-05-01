@@ -32,7 +32,7 @@ async def test_runs_agent_and_replies_with_html_parse_mode():
     reply_text = "<b>Nothing for today.</b>"
     with patch(
         "agentic_tasks.telegram_io.dispatcher.run_agent",
-        return_value=(reply_text, [{"role": "assistant", "content": reply_text}]),
+        return_value=(reply_text, [{"role": "assistant", "content": reply_text}], None),
     ):
         await process_update(update, bot)
 
@@ -46,7 +46,8 @@ async def test_runs_agent_and_replies_with_html_parse_mode():
 
 async def test_falls_back_to_plain_text_when_html_is_invalid():
     """If the LLM emits malformed HTML, Telegram raises BadRequest. We retry
-    once without parse_mode so the user still gets a reply."""
+    once without parse_mode AND with HTML tags stripped, so the user sees
+    readable plain text instead of raw markup."""
     from telegram.error import BadRequest
 
     from agentic_tasks.telegram_io.dispatcher import process_update
@@ -60,13 +61,14 @@ async def test_falls_back_to_plain_text_when_html_is_invalid():
     reply_text = "<b>broken<i></b>"
     with patch(
         "agentic_tasks.telegram_io.dispatcher.run_agent",
-        return_value=(reply_text, [{"role": "assistant", "content": reply_text}]),
+        return_value=(reply_text, [{"role": "assistant", "content": reply_text}], None),
     ):
         await process_update(update, bot)
 
     assert bot.send_message.await_count == 2
     second_call = bot.send_message.await_args_list[1].kwargs
-    assert second_call["text"] == reply_text
+    assert second_call["text"] == "broken"  # HTML stripped
+    assert "<" not in second_call["text"]
     assert "parse_mode" not in second_call
 
 
@@ -82,7 +84,7 @@ async def test_persists_history_across_calls():
 
     with patch(
         "agentic_tasks.telegram_io.dispatcher.run_agent",
-        return_value=("hi", agent_msgs),
+        return_value=("hi", agent_msgs, None),
     ):
         await process_update(update, bot)
 
@@ -104,7 +106,7 @@ async def test_history_is_passed_to_agent_on_subsequent_call():
 
     with patch(
         "agentic_tasks.telegram_io.dispatcher.run_agent",
-        return_value=("ok", [{"role": "assistant", "content": "ok"}]),
+        return_value=("ok", [{"role": "assistant", "content": "ok"}], None),
     ) as mock_agent:
         await process_update(update, bot)
 
@@ -129,7 +131,7 @@ async def test_timeout_replies_with_apology_and_persists_to_history():
 
     with patch(
         "agentic_tasks.telegram_io.dispatcher.run_agent",
-        return_value=("ignored", []),
+        return_value=("ignored", [], None),
     ), patch(
         "agentic_tasks.telegram_io.dispatcher.asyncio.wait_for",
         _timeout_then_cleanup,
@@ -229,7 +231,7 @@ async def test_voice_note_is_transcribed_and_processed():
         return_value="agendar gimnasio mañana a las 8 PM",
     ), patch(
         "agentic_tasks.telegram_io.dispatcher.run_agent",
-        return_value=("Hecho.", [{"role": "assistant", "content": "Hecho."}]),
+        return_value=("Hecho.", [{"role": "assistant", "content": "Hecho."}], None),
     ):
         await process_update(update, bot)
 
