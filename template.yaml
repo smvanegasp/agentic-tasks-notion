@@ -22,6 +22,18 @@ Parameters:
     MinValue: 0
     MaxValue: 59
     Description: Minute of the digest hour.
+  EveningHour:
+    Type: Number
+    Default: 21
+    MinValue: 0
+    MaxValue: 23
+    Description: Hour of day (0-23) when the evening reflection digest fires.
+  EveningMinute:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    MaxValue: 59
+    Description: Minute of the evening digest hour.
   LlmModel:
     Type: String
     Default: openai/gpt-oss-120b
@@ -118,6 +130,28 @@ Resources:
           Type: ScheduleV2
           Properties:
             ScheduleExpression: !Sub "cron(${DigestMinute} ${DigestHour} * * ? *)"
+            ScheduleExpressionTimezone: !Ref Timezone
+            State: ENABLED
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Ref AppSecrets
+
+  # Fires daily at the configured evening time. Sends the reflection
+  # digest with an inline keyboard so the user can close out / push /
+  # move each remaining task with one tap. Button taps land in the
+  # WebhookFunction via update.callback_query.
+  EveningFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: agentic_tasks.handlers.evening.handler
+      Events:
+        Evening:
+          Type: ScheduleV2
+          Properties:
+            ScheduleExpression: !Sub "cron(${EveningMinute} ${EveningHour} * * ? *)"
             ScheduleExpressionTimezone: !Ref Timezone
             State: ENABLED
       Policies:

@@ -278,6 +278,72 @@ def test_find_tasks_rejects_empty_query():
     assert "error" in result
 
 
+@patch("agentic_tasks.agent.tools.update_task")
+@patch("agentic_tasks.agent.tools.query_tasks")
+def test_shift_due_dates_skips_tasks_without_due(mock_query, mock_update):
+    """A matching task with no due date should be skipped silently."""
+    from datetime import date as _date
+
+    from agentic_tasks.agent.tools import (
+        ShiftDueDatesArgs,
+        execute_shift_due_dates,
+    )
+
+    def make(name, due):
+        return Task(
+            page_id=f"id-{name}",
+            name=name,
+            status="To Do",
+            priority=None,
+            due=due,
+        )
+
+    mock_query.return_value = [
+        make("With due", _date(2026, 5, 1)),
+        make("No due", None),
+    ]
+    mock_update.side_effect = lambda page_id, **kw: make("With due", kw["due"])
+
+    updated = execute_shift_due_dates(
+        ShiftDueDatesArgs(delta_days=7, due_on_or_after="2026-05-01")
+    )
+    assert len(updated) == 1
+    mock_update.assert_called_once()
+    new_due = mock_update.call_args.kwargs["due"]
+    assert new_due == _date(2026, 5, 8)
+
+
+@patch("agentic_tasks.agent.tools.query_tasks")
+def test_shift_due_dates_filter_excludes_done(mock_query):
+    """Filter must always exclude Done — completed tasks are never shifted."""
+    from agentic_tasks.agent.tools import ShiftDueDatesArgs, _build_shift_filter
+
+    f = _build_shift_filter(
+        ShiftDueDatesArgs(delta_days=1, due_on_or_after="2026-05-01")
+    )
+    assert "and" in f
+    assert any(
+        c.get("property") == "Status"
+        and c.get("status", {}).get("does_not_equal") == "Done"
+        for c in f["and"]
+    )
+
+
+@patch("agentic_tasks.agent.tools.find_project_by_name")
+def test_shift_due_dates_unknown_project_raises(mock_find):
+    from agentic_tasks.agent.tools import ShiftDueDatesArgs, _build_shift_filter
+
+    mock_find.return_value = None
+    try:
+        _build_shift_filter(
+            ShiftDueDatesArgs(delta_days=1, project_name="zzzz")
+        )
+    except ValueError as e:
+        assert "zzzz" in str(e)
+    else:
+        raise AssertionError("expected ValueError")
+
+
 def test_unknown_tool_returns_error():
     result = call_tool("does_not_exist", {})
     assert "Unknown tool" in result

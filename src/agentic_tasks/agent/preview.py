@@ -17,7 +17,7 @@ import html
 import json
 import logging
 import re
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta  # noqa: F401
 from typing import Any
 
 from pydantic import ValidationError
@@ -25,8 +25,11 @@ from pydantic import ValidationError
 from agentic_tasks.agent.tools import (
     CompleteTaskArgs,
     CreateTaskArgs,
+    ShiftDueDatesArgs,
     UpdateTaskArgs,
     _parse_iso_date,
+    execute_shift_due_dates,
+    resolve_shift_targets,
 )
 from agentic_tasks.config import get_settings
 from agentic_tasks.notion_io.projects import find_project_by_name
@@ -41,7 +44,9 @@ from agentic_tasks.notion_io.tasks import (
 
 log = logging.getLogger(__name__)
 
-WRITE_TOOL_NAMES = frozenset({"create_task", "update_task", "complete_task"})
+WRITE_TOOL_NAMES = frozenset(
+    {"create_task", "update_task", "complete_task", "shift_due_dates"}
+)
 
 _CONFIRM_RE = re.compile(
     r"^\s*(y|yes|yeah|yep|sí|si|ok|okay|sure|👍)\s*[!.]?\s*$",
@@ -94,6 +99,8 @@ def format_preview(plan: list[dict[str, Any]]) -> str:
             lines.append(_format_update_line(args, today))
         elif tool == "complete_task":
             lines.append(_format_complete_line(args))
+        elif tool == "shift_due_dates":
+            lines.extend(_format_shift_lines(args, today))
         else:
             lines.append(f"• {html.escape(tool)}")
     lines.append("")
@@ -158,6 +165,44 @@ def _format_update_line(args: dict[str, Any], today: date) -> str:
 
 def _format_complete_line(args: dict[str, Any]) -> str:
     return f'• Complete "{_resolve_task_name(args.get("page_id", ""))}"'
+
+
+def _format_shift_lines(args_dict: dict[str, Any], today: date) -> list[str]:
+    """Build the multi-line preview for a shift_due_dates plan entry.
+
+    Resolves the filter against Notion at preview time so the user sees the
+    actual tasks that will move (and reads the old → new dates per task).
+    Tasks without a current due date are listed as skipped.
+    """
+    try:
+        args = ShiftDueDatesArgs.model_validate(args_dict)
+    except ValidationError as e:
+        return [f"• shift_due_dates: invalid args ({html.escape(str(e))})"]
+    try:
+        targets = resolve_shift_targets(args)
+    except (ValueError, Exception) as e:  # noqa: BLE001
+        log.warning("preview: resolve_shift_targets failed: %s", e)
+        return [f"• shift_due_dates: {html.escape(str(e))}"]
+    if not targets:
+        return [
+            f"• Shift {args.delta_days:+d} day(s): no matching open tasks."
+        ]
+    lines: list[str] = [
+        f"• Shift {len(targets)} task(s) by {args.delta_days:+d} day(s):"
+    ]
+    delta = timedelta(days=args.delta_days)
+    for task in targets:
+        name = html.escape(task.name) if task.name else "(no title)"
+        if task.due is None:
+            lines.append(f'  – "{name}" — no due date, skipped')
+            continue
+        old_iso = task.due.isoformat()
+        new_iso = (task.due + delta).isoformat()
+        lines.append(
+            f'  – "{name}" — {_format_date_human(old_iso, today)} →'
+            f" {_format_date_human(new_iso, today)}"
+        )
+    return lines
 
 
 def _resolve_task_name(page_id: str) -> str:
@@ -225,6 +270,9 @@ def execute_plan(plan: list[dict[str, Any]]) -> str:
                 successes.append(("Updated", _execute_update(args)))
             elif tool == "complete_task":
                 successes.append(("Completed", _execute_complete(args)))
+            elif tool == "shift_due_dates":
+                for task in _execute_shift(args):
+                    successes.append(("Shifted", task))
             else:
                 errors.append(f"unknown action: {html.escape(str(tool))}")
         except ValidationError as e:
@@ -284,6 +332,11 @@ def _execute_update(args: dict[str, Any]) -> Task:
 def _execute_complete(args: dict[str, Any]) -> Task:
     parsed = CompleteTaskArgs.model_validate(args)
     return complete_task(parsed.page_id)
+
+
+def _execute_shift(args: dict[str, Any]) -> list[Task]:
+    parsed = ShiftDueDatesArgs.model_validate(args)
+    return execute_shift_due_dates(parsed)
 
 
 def _format_summary(

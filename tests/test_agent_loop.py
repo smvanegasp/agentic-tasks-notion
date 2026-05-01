@@ -401,6 +401,184 @@ def test_check_guardrails_no_op_when_no_query_args():
     assert _check_guardrails("anything", None, None) is None
 
 
+def test_count_action_verbs_recognizes_multi_action_request():
+    from agentic_tasks.agent.loop import _count_action_verbs
+
+    # The exact failure mode that prompted this guardrail.
+    assert (
+        _count_action_verbs(
+            "Can you mark as done go to the doctor And also reschedule cinema for tomorrow"
+        )
+        == 2
+    )
+    assert _count_action_verbs("complete X and update Y") == 2
+    assert _count_action_verbs("create A and reschedule B") == 2
+
+
+def test_count_action_verbs_returns_one_for_single_action():
+    from agentic_tasks.agent.loop import _count_action_verbs
+
+    assert _count_action_verbs("mark the doctor as done") == 1
+    assert _count_action_verbs("Reschedule respond offer from APD") == 1
+    assert _count_action_verbs("create a task to call John and Mary") == 1
+
+
+def test_count_action_verbs_is_zero_for_queries_and_chitchat():
+    from agentic_tasks.agent.loop import _count_action_verbs
+
+    assert _count_action_verbs("what do I have today?") == 0
+    assert _count_action_verbs("And the cinema?") == 0
+    assert _count_action_verbs("Cool thank u") == 0
+
+
+def test_count_action_verbs_handles_spanish():
+    from agentic_tasks.agent.loop import _count_action_verbs
+
+    assert _count_action_verbs("marca la tarea como hecha y reagenda cinema") == 2
+    assert _count_action_verbs("crea una tarea") == 1
+
+
+@patch("agentic_tasks.agent.loop.call_tool")
+@patch("agentic_tasks.agent.loop.OpenAI")
+def test_loop_retries_when_user_asked_for_two_actions_but_model_did_one(
+    mock_openai_cls, mock_call_tool
+):
+    """User asks for 2 actions, model emits 1 write → guardrail injects
+    feedback and a second LLM round produces both writes. The final preview
+    contains both."""
+    from agentic_tasks.agent.loop import run_agent
+
+    client = MagicMock()
+    client.chat.completions.create.side_effect = [
+        # First write attempt: only one of two actions. Use create_task so
+        # format_preview doesn't fan out to a real Notion get_task call.
+        _response(
+            tool_calls=[
+                _tool_call(
+                    "create_task",
+                    '{"name": "doctor follow-up"}',
+                    tc_id="tc-1",
+                ),
+            ]
+        ),
+        # After feedback, model emits both writes.
+        _response(
+            tool_calls=[
+                _tool_call(
+                    "create_task",
+                    '{"name": "doctor follow-up"}',
+                    tc_id="tc-2",
+                ),
+                _tool_call(
+                    "create_task",
+                    '{"name": "cinema reschedule"}',
+                    tc_id="tc-3",
+                ),
+            ]
+        ),
+    ]
+    mock_openai_cls.return_value = client
+
+    # Message has exactly 2 action verbs ("create" twice). Avoid messages
+    # with hidden verb counts ("reschedule" inside a task name) that would
+    # raise the expectation above what the second mock can satisfy.
+    reply, _agent_messages, plan = run_agent("create X and create Y")
+
+    assert plan is not None
+    assert len(plan) == 2
+    # Two LLM calls: the failing first write attempt + the corrected one.
+    assert client.chat.completions.create.call_count == 2
+
+
+@patch("agentic_tasks.agent.loop.call_tool")
+@patch("agentic_tasks.agent.loop.OpenAI")
+def test_loop_does_not_retry_for_single_action_request(
+    mock_openai_cls, mock_call_tool
+):
+    """One-verb request should NOT trigger the multi-action retry, even
+    when the model emits one write — that's the expected flow."""
+    from agentic_tasks.agent.loop import run_agent
+
+    client = MagicMock()
+    client.chat.completions.create.return_value = _response(
+        tool_calls=[
+            _tool_call("create_task", '{"name": "X"}', tc_id="tc-1"),
+        ]
+    )
+    mock_openai_cls.return_value = client
+
+    _reply, _agent_messages, plan = run_agent("create X")
+
+    assert plan is not None
+    assert len(plan) == 1
+    assert client.chat.completions.create.call_count == 1
+
+
+@patch("agentic_tasks.agent.loop.call_tool")
+@patch("agentic_tasks.agent.loop.OpenAI")
+def test_multi_action_guardrail_caps_retries(mock_openai_cls, mock_call_tool):
+    """If both retries are also incomplete, accept the third attempt rather
+    than looping forever. The user can ask for the missing action separately."""
+    from agentic_tasks.agent.loop import _MAX_MULTI_ACTION_RETRIES, run_agent
+
+    client = MagicMock()
+    only_one = _response(
+        tool_calls=[
+            _tool_call("create_task", '{"name": "X"}', tc_id="tc-1"),
+        ]
+    )
+    # Original attempt + N retries = N+1 total LLM calls.
+    client.chat.completions.create.side_effect = [
+        only_one for _ in range(_MAX_MULTI_ACTION_RETRIES + 1)
+    ]
+    mock_openai_cls.return_value = client
+
+    _reply, _agent_messages, plan = run_agent("create X and create Y")
+
+    assert plan is not None
+    assert len(plan) == 1
+    assert (
+        client.chat.completions.create.call_count == _MAX_MULTI_ACTION_RETRIES + 1
+    )
+
+
+@patch("agentic_tasks.agent.loop.call_tool")
+@patch("agentic_tasks.agent.loop.OpenAI")
+def test_multi_action_feedback_quotes_user_message(mock_openai_cls, mock_call_tool):
+    """The retry-feedback system message must include the user's verbatim
+    message and the verbs we detected — that grounding is what helps the
+    model catch the dropped clause on the second try."""
+    from agentic_tasks.agent.loop import run_agent
+
+    client = MagicMock()
+    user_msg = "complete X and reschedule Y"
+    client.chat.completions.create.side_effect = [
+        _response(
+            tool_calls=[_tool_call("create_task", '{"name": "X"}', tc_id="tc-1")]
+        ),
+        # Second call returns both — sufficient.
+        _response(
+            tool_calls=[
+                _tool_call("create_task", '{"name": "X"}', tc_id="tc-2"),
+                _tool_call("create_task", '{"name": "Y"}', tc_id="tc-3"),
+            ]
+        ),
+    ]
+    mock_openai_cls.return_value = client
+
+    run_agent(user_msg)
+
+    sent = client.chat.completions.create.call_args.kwargs["messages"]
+    feedback_msgs = [
+        m for m in sent
+        if m.get("role") == "system" and "MULTI-ACTION RECOVERY" in m.get("content", "")
+    ]
+    assert len(feedback_msgs) == 1
+    body = feedback_msgs[0]["content"]
+    assert user_msg in body  # verbatim user message
+    assert "complete" in body and "reschedule" in body  # detected verbs
+
+
 def test_check_guardrails_skips_day_check_for_single_day_query():
     from agentic_tasks.agent.loop import _check_guardrails
 

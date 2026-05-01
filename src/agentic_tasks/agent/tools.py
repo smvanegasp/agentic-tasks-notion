@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from time import perf_counter
 from typing import Any, Literal
 
@@ -185,6 +185,46 @@ class ListProjectsArgs(BaseModel):
     """List every project in the projects DB (for disambiguation)."""
 
 
+class ShiftDueDatesArgs(BaseModel):
+    """Shift the due date of every task matching the filter by an integer
+    number of days. Use for batch reschedules — for example 'push everything
+    from this week to next week' (delta_days=7), 'pull tomorrow back to
+    today' (delta_days=-1).
+
+    Open tasks only — completed tasks are never shifted. Tasks with no due
+    date are skipped silently. Provide at least one filter (due_on,
+    due_on_or_after, due_on_or_before, project_name, or my_day) so the shift
+    has a clear scope; an unfiltered shift across the whole DB is rejected.
+    """
+
+    delta_days: int = Field(
+        ...,
+        description=(
+            "Number of days to shift. Positive moves dates later, negative"
+            " earlier."
+        ),
+    )
+    due_on: str | None = Field(
+        None,
+        description=(
+            "Match tasks whose Due date equals this YYYY-MM-DD before the"
+            " shift."
+        ),
+    )
+    due_on_or_after: str | None = Field(
+        None,
+        description="Match tasks whose Due date is on or after this YYYY-MM-DD.",
+    )
+    due_on_or_before: str | None = Field(
+        None,
+        description="Match tasks whose Due date is on or before this YYYY-MM-DD.",
+    )
+    project_name: str | None = Field(
+        None, description="Filter by project (fuzzy matched)."
+    )
+    my_day: bool | None = Field(None, description="Only tasks marked 'My Day'.")
+
+
 # ---- Tool implementations --------------------------------------------------
 
 
@@ -326,6 +366,74 @@ def _complete_task_tool(args: CompleteTaskArgs) -> str:
     return json.dumps({"completed": _task_to_dict(task)})
 
 
+def _build_shift_filter(args: ShiftDueDatesArgs) -> dict | None:
+    """Translate a ShiftDueDatesArgs into a Notion filter. Always excludes
+    Done tasks. Raises ``ValueError`` if ``project_name`` is supplied but no
+    project matches.
+    """
+    conditions: list[dict] = [
+        {"property": TaskProperty.STATUS, "status": {"does_not_equal": "Done"}}
+    ]
+    if args.due_on:
+        conditions.append(
+            {"property": TaskProperty.DUE, "date": {"equals": args.due_on}}
+        )
+    if args.due_on_or_after:
+        conditions.append(
+            {"property": TaskProperty.DUE, "date": {"on_or_after": args.due_on_or_after}}
+        )
+    if args.due_on_or_before:
+        conditions.append(
+            {"property": TaskProperty.DUE, "date": {"on_or_before": args.due_on_or_before}}
+        )
+    if args.my_day is True:
+        conditions.append(
+            {"property": TaskProperty.MY_DAY, "checkbox": {"equals": True}}
+        )
+    if args.project_name:
+        proj = find_project_by_name(args.project_name)
+        if proj is None:
+            raise ValueError(f"No project matching '{args.project_name}'.")
+        conditions.append(
+            {"property": TaskProperty.PROJECT, "relation": {"contains": proj.page_id}}
+        )
+    return {"and": conditions}
+
+
+def resolve_shift_targets(args: ShiftDueDatesArgs) -> list[Task]:
+    """Find every task that ``shift_due_dates`` would touch. Used by both the
+    confirmation-gate preview (to show the user what will change) and the
+    execute path (to do the shifting). May return tasks with ``due is None``
+    — callers should skip those."""
+    return query_tasks(filter_=_build_shift_filter(args), page_size=100)
+
+
+def execute_shift_due_dates(args: ShiftDueDatesArgs) -> list[Task]:
+    """Apply ``delta_days`` to every matching task with a due date. Returns
+    only the tasks actually updated (no-due tasks are skipped). May return
+    fewer rows than the preview showed if Notion state changed in between."""
+    targets = resolve_shift_targets(args)
+    delta = timedelta(days=args.delta_days)
+    updated: list[Task] = []
+    for task in targets:
+        if task.due is None:
+            continue
+        updated.append(update_task(task.page_id, due=task.due + delta))
+    return updated
+
+
+def _shift_due_dates_tool(args: ShiftDueDatesArgs) -> str:
+    """LLM-facing entry point. NOT called in production — the agent loop
+    intercepts ``shift_due_dates`` calls and routes them through the
+    confirmation gate before any Notion writes happen. This implementation
+    exists so the schema entry stays consistent with other write tools and
+    to keep behavior sensible if the gate is ever bypassed."""
+    updated = execute_shift_due_dates(args)
+    return json.dumps(
+        {"updated": [_task_to_dict(t) for t in updated]}
+    )
+
+
 def _list_projects_tool(_args: ListProjectsArgs) -> str:
     projects = list_projects()
     return json.dumps(
@@ -341,6 +449,7 @@ _TOOLS: dict[str, tuple[type[BaseModel], Any]] = {
     "create_task": (CreateTaskArgs, _create_task_tool),
     "update_task": (UpdateTaskArgs, _update_task_tool),
     "complete_task": (CompleteTaskArgs, _complete_task_tool),
+    "shift_due_dates": (ShiftDueDatesArgs, _shift_due_dates_tool),
     "list_projects": (ListProjectsArgs, _list_projects_tool),
 }
 
@@ -399,5 +508,11 @@ def call_tool(name: str, arguments: dict) -> str:
             e,
         )
         return json.dumps({"error": f"{type(e).__name__}: {e}"})
-    log.info("tool %s done in %.0fms", name, (perf_counter() - start) * 1000)
+    log.info(
+        "tool done",
+        extra={
+            "tool": name,
+            "duration_ms": int((perf_counter() - start) * 1000),
+        },
+    )
     return result

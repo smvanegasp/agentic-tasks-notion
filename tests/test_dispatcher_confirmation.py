@@ -9,6 +9,7 @@ AUTHORIZED_CHAT_ID = 12345
 
 def _update(text: str | None = "hi"):
     update = MagicMock()
+    update.callback_query = None
     update.message = MagicMock()
     update.message.chat_id = AUTHORIZED_CHAT_ID
     update.message.text = text

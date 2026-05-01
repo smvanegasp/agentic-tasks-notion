@@ -17,7 +17,7 @@ from typing import Any
 
 from telegram import Bot
 
-from agentic_tasks._aws import bootstrap_secrets
+from agentic_tasks._aws import bootstrap_secrets, setup_lambda_logging
 from agentic_tasks.config import get_settings
 from agentic_tasks.digest.render import render_digest
 from agentic_tasks.notion_io.tasks import (
@@ -29,7 +29,7 @@ from agentic_tasks.notion_io.tasks import (
 log = logging.getLogger()
 log.setLevel(logging.INFO)
 
-# Pull secrets out of SecretsManager into env vars on cold start (no-op locally).
+setup_lambda_logging()
 bootstrap_secrets()
 
 

@@ -5,10 +5,11 @@ AUTHORIZED_CHAT_ID = 12345
 
 
 def _update(chat_id: int, text: str | None = "hello", voice=None):
-    """Build a fake Update. ``voice`` is None by default so MagicMock's auto-
-    attribute behavior doesn't accidentally make every text update look like a
-    voice update too."""
+    """Build a fake Update. Falsy attributes are set explicitly so MagicMock's
+    auto-attribute behavior doesn't make every text update look like a voice
+    or callback update."""
     update = MagicMock()
+    update.callback_query = None
     update.message = MagicMock()
     update.message.chat_id = chat_id
     update.message.text = text
@@ -187,6 +188,7 @@ async def test_no_message_object_is_ignored():
 
     update = MagicMock()
     update.message = None
+    update.callback_query = None
     bot = _bot()
 
     with patch("agentic_tasks.telegram_io.dispatcher.run_agent") as mock_agent:
@@ -312,3 +314,5 @@ async def test_agent_error_is_caught_and_reported_to_user():
     bot.send_message.assert_awaited_once()
     text = bot.send_message.await_args.kwargs["text"]
     assert "boom" in text or "wrong" in text.lower()
+
+

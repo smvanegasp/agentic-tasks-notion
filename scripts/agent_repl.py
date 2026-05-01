@@ -72,7 +72,7 @@ def main() -> None:
         store.append(_REPL_CHAT_ID, {"role": "user", "content": user_message})
 
         try:
-            reply, agent_messages = run_agent(user_message, history)
+            reply, agent_messages, _pending = run_agent(user_message, history)
         except Exception as e:  # noqa: BLE001
             print(f"error: {type(e).__name__}: {e}")
             store.append(

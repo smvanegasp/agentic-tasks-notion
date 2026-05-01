@@ -14,14 +14,15 @@ from typing import Any
 
 from telegram import Bot, Update
 
-from agentic_tasks._aws import bootstrap_secrets
+from agentic_tasks._aws import bootstrap_secrets, setup_lambda_logging
 from agentic_tasks.config import get_settings
 from agentic_tasks.telegram_io.dispatcher import process_update
 
 log = logging.getLogger()
 log.setLevel(logging.INFO)
 
-# Pull secrets out of SecretsManager into env vars on cold start (no-op locally).
+# Cold-start setup: switch logs to JSON in Lambda, then pull secrets.
+setup_lambda_logging()
 bootstrap_secrets()
 
 

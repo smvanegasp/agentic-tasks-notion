@@ -232,6 +232,93 @@ def test_format_date_human_friendly_format(iso, expected_substr):
     assert expected_substr in _format_date_human(iso, today)
 
 
+def test_format_preview_shift_due_dates_lists_each_task():
+    """The shift preview resolves the filter against Notion at preview time
+    and lists each affected task with old → new dates."""
+    from datetime import date as _date
+
+    from agentic_tasks.agent.preview import format_preview
+    from agentic_tasks.notion_io.tasks import Task
+
+    targets = [
+        Task(
+            page_id="p1",
+            name="Buy markers",
+            status="To Do",
+            priority=None,
+            due=_date(2026, 5, 1),
+        ),
+        Task(
+            page_id="p2",
+            name="No due here",
+            status="To Do",
+            priority=None,
+            due=None,
+        ),
+    ]
+    plan = [
+        {
+            "tool": "shift_due_dates",
+            "arguments": {"delta_days": 7, "due_on_or_after": "2026-05-01"},
+        }
+    ]
+    with patch(
+        "agentic_tasks.agent.preview.resolve_shift_targets",
+        return_value=targets,
+    ):
+        out = format_preview(plan)
+    assert "Shift 2 task(s) by +7 day(s):" in out
+    assert "Buy markers" in out
+    assert "no due date, skipped" in out
+
+
+def test_format_preview_shift_due_dates_handles_no_matches():
+    from agentic_tasks.agent.preview import format_preview
+
+    plan = [{"tool": "shift_due_dates", "arguments": {"delta_days": 1, "due_on": "2026-05-01"}}]
+    with patch("agentic_tasks.agent.preview.resolve_shift_targets", return_value=[]):
+        out = format_preview(plan)
+    assert "no matching open tasks" in out
+
+
+def test_execute_plan_shift_due_dates_flattens_results():
+    """Each shifted task should produce its own success entry in the summary."""
+    from datetime import date as _date
+
+    from agentic_tasks.agent.preview import execute_plan
+    from agentic_tasks.notion_io.tasks import Task
+
+    shifted = [
+        Task(
+            page_id="p1",
+            name="A",
+            status="To Do",
+            priority=None,
+            due=_date(2026, 5, 8),
+            url="https://notion.so/p1",
+        ),
+        Task(
+            page_id="p2",
+            name="B",
+            status="To Do",
+            priority=None,
+            due=_date(2026, 5, 9),
+            url="https://notion.so/p2",
+        ),
+    ]
+    with patch(
+        "agentic_tasks.agent.preview.execute_shift_due_dates",
+        return_value=shifted,
+    ):
+        out = execute_plan(
+            [{"tool": "shift_due_dates", "arguments": {"delta_days": 7, "due_on": "2026-05-01"}}]
+        )
+    assert "Done." in out
+    assert out.count("Shifted") == 2
+    assert "A" in out
+    assert "B" in out
+
+
 def test_format_date_human_today_and_tomorrow():
     from agentic_tasks.agent.preview import _format_date_human
 

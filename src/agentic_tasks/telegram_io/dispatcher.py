@@ -58,6 +58,16 @@ _TELEGRAM_MAX_CHARS = 4000
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 
 
+def _format_error(e: BaseException) -> str:
+    """Telegram-HTML error message used when the agent or plan execution
+    crashes. Escapes both the exception class and message so we never inject
+    raw markup the user supplied."""
+    return (
+        f"Sorry, something went wrong: <code>{html.escape(type(e).__name__)}"
+        f"</code>: {html.escape(str(e))}"
+    )
+
+
 def _strip_html(text: str) -> str:
     """Remove HTML tags and unescape entities — used for the plain-text
     fallback when Telegram rejects our HTML, so the user sees readable text
@@ -148,14 +158,17 @@ async def process_update(update: Update, bot: Bot) -> None:
         await _send(bot, chat_id, _UNSUPPORTED_MESSAGE)
         return
 
-    log.info("processing chat_id=%s text=%r", chat_id, user_text[:80])
+    log.info(
+        "processing message",
+        extra={"chat_id": chat_id, "text_preview": user_text[:80]},
+    )
 
     store = get_store()
 
     # /reset short-circuits everything.
     if user_text.strip().lower() == "/reset":
         store.reset(chat_id)
-        log.info("conversation reset for chat_id=%s", chat_id)
+        log.info("conversation reset", extra={"chat_id": chat_id})
         await _send(bot, chat_id, voice_prefix + _RESET_REPLY)
         return
 
@@ -165,8 +178,12 @@ async def process_update(update: Update, bot: Bot) -> None:
     if pending_plan:
         if is_confirmation(user_text):
             log.info(
-                "confirmation gate: executing pending plan (%d entries)",
-                len(pending_plan),
+                "executing pending plan",
+                extra={
+                    "chat_id": chat_id,
+                    "plan_size": len(pending_plan),
+                    "stage": "confirm",
+                },
             )
             await bot.send_chat_action(chat_id=chat_id, action="typing")
             store.append(chat_id, {"role": "user", "content": user_text})
@@ -174,17 +191,17 @@ async def process_update(update: Update, bot: Bot) -> None:
                 summary = await asyncio.to_thread(execute_plan, pending_plan)
             except Exception as e:  # noqa: BLE001
                 log.exception("execute_plan failed")
-                summary = (
-                    f"Sorry, something went wrong: <code>{html.escape(type(e).__name__)}"
-                    f"</code>: {html.escape(str(e))}"
-                )
+                summary = _format_error(e)
             store.clear_pending_plan(chat_id)
             store.append(chat_id, {"role": "assistant", "content": summary})
             await _send(bot, chat_id, voice_prefix + summary)
             return
 
         if is_rejection(user_text):
-            log.info("confirmation gate: plan rejected; awaiting feedback")
+            log.info(
+                "pending plan rejected",
+                extra={"chat_id": chat_id, "stage": "reject"},
+            )
             store.append(chat_id, {"role": "user", "content": user_text})
             store.clear_pending_plan(chat_id)
             store.append(chat_id, {"role": "assistant", "content": _REJECTION_REPLY})
@@ -196,7 +213,10 @@ async def process_update(update: Update, bot: Bot) -> None:
         # already-persisted preview as part of history. We also pass a
         # transient correction note so the model knows the previous
         # proposal was rejected and shouldn't re-propose the same thing.
-        log.info("confirmation gate: clarification — clearing pending plan")
+        log.info(
+            "pending plan dropped on clarification",
+            extra={"chat_id": chat_id, "stage": "clarify"},
+        )
         store.clear_pending_plan(chat_id)
         correction_note = (
             "The user just REJECTED your previous pending plan with the"
@@ -229,16 +249,19 @@ async def process_update(update: Update, bot: Bot) -> None:
         store.append(chat_id, {"role": "assistant", "content": reply})
     except Exception as e:  # noqa: BLE001
         log.exception("agent error")
-        reply = (
-            f"Sorry, something went wrong: <code>{html.escape(type(e).__name__)}"
-            f"</code>: {html.escape(str(e))}"
-        )
+        reply = _format_error(e)
         store.append(chat_id, {"role": "assistant", "content": reply})
     else:
         for msg in agent_messages:
             store.append(chat_id, msg)
         if new_pending_plan:
             store.set_pending_plan(chat_id, new_pending_plan)
-    log.info("turn done in %.0fms", (perf_counter() - turn_start) * 1000)
+    log.info(
+        "turn done",
+        extra={
+            "chat_id": chat_id,
+            "duration_ms": int((perf_counter() - turn_start) * 1000),
+        },
+    )
 
     await _send(bot, chat_id, voice_prefix + reply)
