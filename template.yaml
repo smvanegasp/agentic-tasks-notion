@@ -1,0 +1,137 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Telegram-driven Notion to-do agent. Two Lambdas (webhook + daily digest),
+  one SecretsManager secret, one DynamoDB table for conversation history.
+
+# Edit these to change behavior — then `sam deploy` to apply.
+Parameters:
+  Timezone:
+    Type: String
+    Default: America/New_York
+    Description: IANA timezone for the digest schedule and date math.
+  DigestHour:
+    Type: Number
+    Default: 8
+    MinValue: 0
+    MaxValue: 23
+    Description: Hour of day (0-23) when the digest fires, in `Timezone`.
+  DigestMinute:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    MaxValue: 59
+    Description: Minute of the digest hour.
+  LlmModel:
+    Type: String
+    Default: openai/gpt-oss-120b
+  LlmBaseUrl:
+    Type: String
+    Default: https://api.groq.com/openai/v1
+  TranscriptionModel:
+    Type: String
+    Default: whisper-large-v3
+  ConversationHistoryLimit:
+    Type: Number
+    Default: 40
+  AgentTimeoutSeconds:
+    Type: Number
+    Default: 60
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 90
+    MemorySize: 512
+    Architectures: [arm64]
+    Environment:
+      Variables:
+        TIMEZONE: !Ref Timezone
+        DIGEST_TIME: !Sub "${DigestHour}:${DigestMinute}"
+        LLM_MODEL: !Ref LlmModel
+        LLM_BASE_URL: !Ref LlmBaseUrl
+        TRANSCRIPTION_MODEL: !Ref TranscriptionModel
+        CONVERSATION_HISTORY_LIMIT: !Ref ConversationHistoryLimit
+        AGENT_TIMEOUT_SECONDS: !Ref AgentTimeoutSeconds
+        CONVERSATION_TABLE_NAME: !Ref ConversationTable
+        SECRETS_NAME: !Ref AppSecrets
+
+Resources:
+
+  # Holds Telegram tokens, Notion tokens, LLM API key, allowed user ID,
+  # DB IDs, optional webhook secret. Created empty — populate after first
+  # deploy via `scripts/seed_secrets.py`.
+  AppSecrets:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AWS::StackName}-secrets"
+      Description: Telegram + Notion + LLM credentials and IDs.
+
+  # Per-chat conversation history. Daily TTL prunes old chats automatically.
+  ConversationTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AWS::StackName}-conversation"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: chat_id
+          AttributeType: N
+      KeySchema:
+        - AttributeName: chat_id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # Receives Telegram updates via API Gateway HTTP API.
+  WebhookFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: agentic_tasks.handlers.webhook.handler
+      Events:
+        Webhook:
+          Type: HttpApi
+          Properties:
+            Path: /webhook
+            Method: POST
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Ref AppSecrets
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:DeleteItem
+              Resource: !GetAtt ConversationTable.Arn
+
+  # Fires daily at the configured local time. Sends the morning digest.
+  DigestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: agentic_tasks.handlers.digest.handler
+      Events:
+        Daily:
+          Type: ScheduleV2
+          Properties:
+            ScheduleExpression: !Sub "cron(${DigestMinute} ${DigestHour} * * ? *)"
+            ScheduleExpressionTimezone: !Ref Timezone
+            State: ENABLED
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Ref AppSecrets
+
+Outputs:
+  WebhookUrl:
+    Description: POST this URL into Telegram via setWebhook (see scripts/set_webhook.py).
+    Value: !Sub "https://${ServerlessHttpApi}.execute-api.${AWS::Region}.amazonaws.com/webhook"
+  SecretsName:
+    Description: Pass this to scripts/seed_secrets.py to populate credentials.
+    Value: !Ref AppSecrets
+  ConversationTableName:
+    Value: !Ref ConversationTable

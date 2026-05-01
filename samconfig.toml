@@ -1,0 +1,15 @@
+version = 0.1
+
+[default.global.parameters]
+stack_name = "agentic-tasks-notion"
+region = "us-east-2"
+
+[default.deploy.parameters]
+region = "us-east-2"
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = true
+resolve_s3 = true
+s3_prefix = "agentic-tasks-notion"
+disable_rollback = true
+parameter_overrides = "Timezone=\"America/New_York\" DigestHour=\"8\" DigestMinute=\"0\" LlmModel=\"openai/gpt-oss-120b\" LlmBaseUrl=\"https://api.groq.com/openai/v1\" TranscriptionModel=\"whisper-large-v3\" ConversationHistoryLimit=\"40\" AgentTimeoutSeconds=\"60\""
+image_repositories = []
