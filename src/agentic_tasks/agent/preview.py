@@ -1,11 +1,10 @@
 """Confirmation gate: preview formatting + pending-plan execution.
 
-When the agent emits write tool calls (create_task, update_task,
-complete_task), the loop short-circuits without executing them and stashes a
-``pending_plan`` in the conversation store. The user sees a
-deterministically-formatted preview built here and replies y/n. On y, the
-dispatcher calls :func:`execute_plan` to run the writes and produce a
-summary message.
+When the agent emits any write tool call (``create_tasks``, ``update_tasks``,
+``complete_tasks``, ``shift_due_dates``), the loop short-circuits without
+executing them and stashes a ``pending_plan`` in the conversation store.
+The user sees ONE deterministic preview of every action in the round and
+replies y/n once. On y, the dispatcher calls :func:`execute_plan`.
 
 All Telegram-facing strings here use HTML parse mode and only the tags
 allowed by Telegram (``<b>``, ``<a>``). Task names are HTML-escaped.
@@ -17,35 +16,31 @@ import html
 import json
 import logging
 import re
-from datetime import date, datetime, timedelta  # noqa: F401
+from datetime import date, datetime, timedelta
 from typing import Any
 
 from pydantic import ValidationError
 
 from agentic_tasks.agent.tools import (
-    CompleteTaskArgs,
-    CreateTaskArgs,
+    CompleteTasksArgs,
+    CreateTasksArgs,
+    NewTask,
     ShiftDueDatesArgs,
-    UpdateTaskArgs,
-    _parse_iso_date,
+    TaskUpdate,
+    UpdateTasksArgs,
+    execute_complete_tasks,
+    execute_create_tasks,
     execute_shift_due_dates,
+    execute_update_tasks,
     resolve_shift_targets,
 )
 from agentic_tasks.config import get_settings
-from agentic_tasks.notion_io.projects import find_project_by_name
-from agentic_tasks.notion_io.schema import Priority, Status
-from agentic_tasks.notion_io.tasks import (
-    Task,
-    complete_task,
-    create_task,
-    get_task,
-    update_task,
-)
+from agentic_tasks.notion_io.tasks import Task, get_task
 
 log = logging.getLogger(__name__)
 
 WRITE_TOOL_NAMES = frozenset(
-    {"create_task", "update_task", "complete_task", "shift_due_dates"}
+    {"create_tasks", "update_tasks", "complete_tasks", "shift_due_dates"}
 )
 
 _CONFIRM_RE = re.compile(
@@ -70,6 +65,8 @@ def serialize_plan(tool_calls: list[Any]) -> list[dict[str, Any]]:
     """Convert OpenAI tool_call objects into a JSON-safe pending plan.
 
     Only entries whose tool name is in :data:`WRITE_TOOL_NAMES` are kept.
+    Reads in the same round are dropped — the model can re-issue them next
+    turn after confirmation.
     """
     plan: list[dict[str, Any]] = []
     for tc in tool_calls:
@@ -87,18 +84,24 @@ def serialize_plan(tool_calls: list[Any]) -> list[dict[str, Any]]:
 
 
 def format_preview(plan: list[dict[str, Any]]) -> str:
-    """Build the user-visible preview text for a pending plan."""
+    """Build the user-visible preview text for a pending plan.
+
+    Each plan entry is a batch tool call (``create_tasks`` with N tasks,
+    ``update_tasks`` with N updates, etc.). All entries are flattened into
+    one bullet list under a single ``About to:`` header so the user sees
+    the entire change set in one message and confirms with one ``y``.
+    """
     today = datetime.now(get_settings().timezone).date()
     lines: list[str] = ["About to:"]
     for entry in plan:
         tool = entry["tool"]
         args = entry.get("arguments") or {}
-        if tool == "create_task":
-            lines.append(_format_create_line(args, today))
-        elif tool == "update_task":
-            lines.append(_format_update_line(args, today))
-        elif tool == "complete_task":
-            lines.append(_format_complete_line(args))
+        if tool == "create_tasks":
+            lines.extend(_format_create_lines(args, today))
+        elif tool == "update_tasks":
+            lines.extend(_format_update_lines(args, today))
+        elif tool == "complete_tasks":
+            lines.extend(_format_complete_lines(args))
         elif tool == "shift_due_dates":
             lines.extend(_format_shift_lines(args, today))
         else:
@@ -108,52 +111,65 @@ def format_preview(plan: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def _format_create_line(args: dict[str, Any], today: date) -> str:
-    name = html.escape(str(args.get("name") or "(unnamed)"))
+def _format_create_lines(args_dict: dict[str, Any], today: date) -> list[str]:
+    try:
+        args = CreateTasksArgs.model_validate(args_dict)
+    except ValidationError as e:
+        return [f"• create_tasks: invalid args ({html.escape(str(e))})"]
+    return [_format_create_line(spec, today) for spec in args.tasks]
+
+
+def _format_create_line(spec: NewTask, today: date) -> str:
+    name = html.escape(spec.name or "(unnamed)")
     details: list[str] = []
-    if args.get("due"):
-        details.append(f"due {_format_date_human(args['due'], today)}")
-    if args.get("priority"):
-        details.append(f"priority {args['priority']}")
-    if args.get("project_name"):
-        details.append(f"project: {html.escape(str(args['project_name']))}")
-    if args.get("my_day"):
+    if spec.due:
+        details.append(f"due {_format_date_human(spec.due, today)}")
+    if spec.priority:
+        details.append(f"priority {spec.priority}")
+    if spec.project_name:
+        details.append(f"project: {html.escape(spec.project_name)}")
+    if spec.my_day:
         details.append("My Day")
-    if args.get("labels"):
+    if spec.labels:
         details.append(
-            "labels: " + ", ".join(html.escape(str(label)) for label in args["labels"])
+            "labels: " + ", ".join(html.escape(label) for label in spec.labels)
         )
     suffix = f" — {'; '.join(details)}" if details else ""
     return f'• Create "{name}"{suffix}'
 
 
-def _format_update_line(args: dict[str, Any], today: date) -> str:
-    page_id = args.get("page_id", "")
-    name = _resolve_task_name(page_id)
+def _format_update_lines(args_dict: dict[str, Any], today: date) -> list[str]:
+    try:
+        args = UpdateTasksArgs.model_validate(args_dict)
+    except ValidationError as e:
+        return [f"• update_tasks: invalid args ({html.escape(str(e))})"]
+    return [_format_update_line(spec, today) for spec in args.updates]
 
+
+def _format_update_line(spec: TaskUpdate, today: date) -> str:
+    name = _resolve_task_name(spec.page_id)
     changes: list[str] = []
-    if args.get("name") is not None:
-        changes.append(f"name → {html.escape(str(args['name']))}")
-    if args.get("description") is not None:
+    if spec.name is not None:
+        changes.append(f"name → {html.escape(spec.name)}")
+    if spec.description is not None:
         changes.append("description updated")
-    if args.get("priority") is not None:
-        changes.append(f"priority → {args['priority']}")
-    if args.get("status") is not None:
-        changes.append(f"status → {args['status']}")
-    if args.get("project_name") is not None:
-        changes.append(f"project → {html.escape(str(args['project_name']))}")
-    if args.get("due") is not None:
-        if args["due"] == "":
+    if spec.priority is not None:
+        changes.append(f"priority → {spec.priority}")
+    if spec.status is not None:
+        changes.append(f"status → {spec.status}")
+    if spec.project_name is not None:
+        changes.append(f"project → {html.escape(spec.project_name)}")
+    if spec.due is not None:
+        if spec.due == "":
             changes.append("due → cleared")
         else:
-            changes.append(f"due → {_format_date_human(args['due'], today)}")
-    if args.get("my_day") is not None:
-        changes.append("My Day → on" if args["my_day"] else "My Day → off")
-    if args.get("labels") is not None:
-        labels = args["labels"] or []
-        if labels:
+            changes.append(f"due → {_format_date_human(spec.due, today)}")
+    if spec.my_day is not None:
+        changes.append("My Day → on" if spec.my_day else "My Day → off")
+    if spec.labels is not None:
+        if spec.labels:
             changes.append(
-                "labels → " + ", ".join(html.escape(str(label)) for label in labels)
+                "labels → " + ", ".join(html.escape(label) for label in spec.labels)
             )
         else:
             changes.append("labels → cleared")
@@ -163,8 +179,14 @@ def _format_update_line(args: dict[str, Any], today: date) -> str:
     return f'• Update "{name}": {"; ".join(changes)}'
 
 
-def _format_complete_line(args: dict[str, Any]) -> str:
-    return f'• Complete "{_resolve_task_name(args.get("page_id", ""))}"'
+def _format_complete_lines(args_dict: dict[str, Any]) -> list[str]:
+    try:
+        args = CompleteTasksArgs.model_validate(args_dict)
+    except ValidationError as e:
+        return [f"• complete_tasks: invalid args ({html.escape(str(e))})"]
+    return [
+        f'• Complete "{_resolve_task_name(page_id)}"' for page_id in args.page_ids
+    ]
 
 
 def _format_shift_lines(args_dict: dict[str, Any], today: date) -> list[str]:
@@ -180,13 +202,11 @@ def _format_shift_lines(args_dict: dict[str, Any], today: date) -> list[str]:
         return [f"• shift_due_dates: invalid args ({html.escape(str(e))})"]
     try:
         targets = resolve_shift_targets(args)
-    except (ValueError, Exception) as e:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
         log.warning("preview: resolve_shift_targets failed: %s", e)
         return [f"• shift_due_dates: {html.escape(str(e))}"]
     if not targets:
-        return [
-            f"• Shift {args.delta_days:+d} day(s): no matching open tasks."
-        ]
+        return [f"• Shift {args.delta_days:+d} day(s): no matching open tasks."]
     lines: list[str] = [
         f"• Shift {len(targets)} task(s) by {args.delta_days:+d} day(s):"
     ]
@@ -255,88 +275,101 @@ def _format_time(dt: datetime) -> str:
 def execute_plan(plan: list[dict[str, Any]]) -> str:
     """Execute a confirmed pending plan; return a Telegram-HTML summary.
 
-    Each entry is dispatched independently — one failing entry does not abort
-    the rest. Successes and failures are reported together in the summary.
+    Each batch entry is dispatched independently, and within a batch each
+    task is dispatched independently — one failing entry does not abort the
+    rest. Successes and failures are reported together in the summary.
     """
     successes: list[tuple[str, Task]] = []
     errors: list[str] = []
     for entry in plan:
         tool = entry["tool"]
         args = entry.get("arguments") or {}
-        try:
-            if tool == "create_task":
-                successes.append(("Created", _execute_create(args)))
-            elif tool == "update_task":
-                successes.append(("Updated", _execute_update(args)))
-            elif tool == "complete_task":
-                successes.append(("Completed", _execute_complete(args)))
-            elif tool == "shift_due_dates":
-                for task in _execute_shift(args):
-                    successes.append(("Shifted", task))
-            else:
-                errors.append(f"unknown action: {html.escape(str(tool))}")
-        except ValidationError as e:
-            errors.append(f"invalid args for {tool}: {html.escape(str(e))}")
-        except Exception as e:  # noqa: BLE001
-            log.exception("execute_plan: %s failed", tool)
-            errors.append(f"{tool} failed: {html.escape(str(e))}")
+        if tool == "create_tasks":
+            _run_create_batch(args, successes, errors)
+        elif tool == "update_tasks":
+            _run_update_batch(args, successes, errors)
+        elif tool == "complete_tasks":
+            _run_complete_batch(args, successes, errors)
+        elif tool == "shift_due_dates":
+            _run_shift_batch(args, successes, errors)
+        else:
+            errors.append(f"unknown action: {html.escape(str(tool))}")
     return _format_summary(successes, errors)
 
 
-def _execute_create(args: dict[str, Any]) -> Task:
-    parsed = CreateTaskArgs.model_validate(args)
-    parsed_due = _parse_iso_date(parsed.due) if parsed.due else None
-    parsed_priority = Priority(parsed.priority) if parsed.priority else None
-    project_ids: list[str] | None = None
-    if parsed.project_name:
-        proj = find_project_by_name(parsed.project_name)
-        if proj is None:
-            raise ValueError(f"no project matching '{parsed.project_name}'")
-        project_ids = [proj.page_id]
-    return create_task(
-        name=parsed.name,
-        description=parsed.description,
-        due=parsed_due,
-        priority=parsed_priority,
-        project_ids=project_ids,
-        labels=parsed.labels,
-        my_day=parsed.my_day,
-    )
+def _run_create_batch(
+    args_dict: dict[str, Any],
+    successes: list[tuple[str, Task]],
+    errors: list[str],
+) -> None:
+    try:
+        args = CreateTasksArgs.model_validate(args_dict)
+    except ValidationError as e:
+        errors.append(f"invalid create_tasks args: {html.escape(str(e))}")
+        return
+    for spec in args.tasks:
+        try:
+            task = execute_create_tasks(CreateTasksArgs(tasks=[spec]))[0]
+            successes.append(("Created", task))
+        except Exception as e:  # noqa: BLE001
+            log.exception("create_tasks: %r failed", spec.name)
+            errors.append(f'create "{html.escape(spec.name)}" failed: {html.escape(str(e))}')
 
 
-def _execute_update(args: dict[str, Any]) -> Task:
-    parsed = UpdateTaskArgs.model_validate(args)
-    kwargs: dict[str, Any] = {}
-    if parsed.name is not None:
-        kwargs["name"] = parsed.name
-    if parsed.description is not None:
-        kwargs["description"] = parsed.description
-    if parsed.due is not None:
-        kwargs["due"] = None if parsed.due == "" else _parse_iso_date(parsed.due)
-    if parsed.priority is not None:
-        kwargs["priority"] = Priority(parsed.priority)
-    if parsed.status is not None:
-        kwargs["status"] = Status(parsed.status)
-    if parsed.project_name is not None:
-        proj = find_project_by_name(parsed.project_name)
-        if proj is None:
-            raise ValueError(f"no project matching '{parsed.project_name}'")
-        kwargs["project_ids"] = [proj.page_id]
-    if parsed.labels is not None:
-        kwargs["labels"] = parsed.labels
-    if parsed.my_day is not None:
-        kwargs["my_day"] = parsed.my_day
-    return update_task(parsed.page_id, **kwargs)
+def _run_update_batch(
+    args_dict: dict[str, Any],
+    successes: list[tuple[str, Task]],
+    errors: list[str],
+) -> None:
+    try:
+        args = UpdateTasksArgs.model_validate(args_dict)
+    except ValidationError as e:
+        errors.append(f"invalid update_tasks args: {html.escape(str(e))}")
+        return
+    for spec in args.updates:
+        try:
+            task = execute_update_tasks(UpdateTasksArgs(updates=[spec]))[0]
+            successes.append(("Updated", task))
+        except Exception as e:  # noqa: BLE001
+            log.exception("update_tasks: %s failed", spec.page_id)
+            errors.append(f"update {html.escape(spec.page_id[:8])} failed: {html.escape(str(e))}")
 
 
-def _execute_complete(args: dict[str, Any]) -> Task:
-    parsed = CompleteTaskArgs.model_validate(args)
-    return complete_task(parsed.page_id)
+def _run_complete_batch(
+    args_dict: dict[str, Any],
+    successes: list[tuple[str, Task]],
+    errors: list[str],
+) -> None:
+    try:
+        args = CompleteTasksArgs.model_validate(args_dict)
+    except ValidationError as e:
+        errors.append(f"invalid complete_tasks args: {html.escape(str(e))}")
+        return
+    for page_id in args.page_ids:
+        try:
+            task = execute_complete_tasks(CompleteTasksArgs(page_ids=[page_id]))[0]
+            successes.append(("Completed", task))
+        except Exception as e:  # noqa: BLE001
+            log.exception("complete_tasks: %s failed", page_id)
+            errors.append(f"complete {html.escape(page_id[:8])} failed: {html.escape(str(e))}")
 
 
-def _execute_shift(args: dict[str, Any]) -> list[Task]:
-    parsed = ShiftDueDatesArgs.model_validate(args)
-    return execute_shift_due_dates(parsed)
+def _run_shift_batch(
+    args_dict: dict[str, Any],
+    successes: list[tuple[str, Task]],
+    errors: list[str],
+) -> None:
+    try:
+        args = ShiftDueDatesArgs.model_validate(args_dict)
+    except ValidationError as e:
+        errors.append(f"invalid shift_due_dates args: {html.escape(str(e))}")
+        return
+    try:
+        for task in execute_shift_due_dates(args):
+            successes.append(("Shifted", task))
+    except Exception as e:  # noqa: BLE001
+        log.exception("shift_due_dates failed")
+        errors.append(f"shift_due_dates failed: {html.escape(str(e))}")
 
 
 def _format_summary(

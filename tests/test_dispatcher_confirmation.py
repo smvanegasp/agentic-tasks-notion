@@ -31,7 +31,8 @@ async def test_slash_reset_clears_store_and_replies():
     store = get_store()
     store.append(AUTHORIZED_CHAT_ID, {"role": "user", "content": "earlier"})
     store.set_pending_plan(
-        AUTHORIZED_CHAT_ID, [{"tool": "create_task", "arguments": {"name": "X"}}]
+        AUTHORIZED_CHAT_ID,
+        [{"tool": "create_tasks", "arguments": {"tasks": [{"name": "X"}]}}],
     )
 
     update = _update("/reset")
@@ -52,7 +53,12 @@ async def test_yes_executes_pending_plan_and_clears_it():
     from agentic_tasks.telegram_io.dispatcher import process_update
 
     store = get_store()
-    plan = [{"tool": "create_task", "arguments": {"name": "Buy markers"}}]
+    plan = [
+        {
+            "tool": "create_tasks",
+            "arguments": {"tasks": [{"name": "Buy markers"}]},
+        }
+    ]
     store.set_pending_plan(AUTHORIZED_CHAT_ID, plan)
 
     update = _update("y")
@@ -79,7 +85,7 @@ async def test_no_clears_pending_and_asks_for_feedback():
 
     store = get_store()
     store.set_pending_plan(
-        AUTHORIZED_CHAT_ID, [{"tool": "create_task", "arguments": {"name": "X"}}]
+        AUTHORIZED_CHAT_ID, [{"tool": "create_tasks", "arguments": {"tasks": [{"name": "X"}]}}]
     )
 
     update = _update("n")
@@ -108,7 +114,7 @@ async def test_clarification_clears_pending_and_runs_agent():
 
     store = get_store()
     store.set_pending_plan(
-        AUTHORIZED_CHAT_ID, [{"tool": "create_task", "arguments": {"name": "X"}}]
+        AUTHORIZED_CHAT_ID, [{"tool": "create_tasks", "arguments": {"tasks": [{"name": "X"}]}}]
     )
 
     update = _update("actually make it Friday")
@@ -159,7 +165,7 @@ async def test_cancel_word_clears_pending_via_rejection_path():
 
     store = get_store()
     store.set_pending_plan(
-        AUTHORIZED_CHAT_ID, [{"tool": "create_task", "arguments": {"name": "X"}}]
+        AUTHORIZED_CHAT_ID, [{"tool": "create_tasks", "arguments": {"tasks": [{"name": "X"}]}}]
     )
 
     update = _update("Cancel")
@@ -186,7 +192,12 @@ async def test_agent_returning_pending_plan_persists_it_in_store():
     update = _update("create buy markers")
     bot = _bot()
 
-    plan = [{"tool": "create_task", "arguments": {"name": "Buy markers"}}]
+    plan = [
+        {
+            "tool": "create_tasks",
+            "arguments": {"tasks": [{"name": "Buy markers"}]},
+        }
+    ]
     preview = "About to:\n• Create Buy markers\n\nReply y to proceed or n to cancel."
 
     with patch(

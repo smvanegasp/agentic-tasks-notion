@@ -1,13 +1,14 @@
 """Agent tools: Pydantic-backed function-calling schemas and a dispatcher.
 
-Tool argument shapes are declared as Pydantic models. The OpenAI SDK helper
-``openai.pydantic_function_tool()`` converts each model into a strict tool
-schema that the LLM sees, and ``call_tool`` validates incoming JSON arguments
-against the same model before dispatching to the underlying implementation.
+Tool argument shapes are declared as Pydantic models. Each model becomes a
+non-strict tool schema the LLM sees, and ``call_tool`` validates incoming
+JSON arguments against the same model before dispatching.
 
-Adding a new tool: define a ``BaseModel`` for its arguments, add an entry to
-``_TOOLS`` mapping the tool name to (model, implementation, description), and
-both the schema and the dispatcher pick it up automatically.
+Write tools (``create_tasks``, ``update_tasks``, ``complete_tasks``,
+``shift_due_dates``) are batch-shaped on purpose: every write takes a list,
+even for a single item. That removes the "emit N calls together" prompt
+problem — the model just adds entries to one list, and the confirmation gate
+previews + executes one batch.
 """
 
 from __future__ import annotations
@@ -124,11 +125,12 @@ class QueryTasksArgs(BaseModel):
 class FindTasksArgs(BaseModel):
     """Fuzzy-search for open tasks by partial name, acronym, or keyword.
 
-    Use this BEFORE update_task / complete_task whenever the user references
+    Use this BEFORE update_tasks / complete_tasks whenever the user references
     a task by less than its full name (e.g., 'APD task', 'the doctor
     appointment', 'cinema'). Returns the best matches with their page_ids
     so you can act on the right one without guessing from earlier
-    conversation history.
+    conversation history. If the user names multiple tasks, call find_tasks
+    in parallel — one call per task — in the same round.
     """
 
     name_query: str = Field(
@@ -140,8 +142,8 @@ class FindTasksArgs(BaseModel):
     limit: int = Field(5, description="Maximum number of matches to return.")
 
 
-class CreateTaskArgs(BaseModel):
-    """Create a new task in Notion."""
+class NewTask(BaseModel):
+    """One task to create. Used inside create_tasks."""
 
     name: str
     description: str | None = None
@@ -160,9 +162,19 @@ class CreateTaskArgs(BaseModel):
     my_day: bool = False
 
 
-class UpdateTaskArgs(BaseModel):
-    """Update fields on an existing task. Only provided fields change. Pass an
-    empty string for 'due' to clear it."""
+class CreateTasksArgs(BaseModel):
+    """Create one or more new tasks in a single batch.
+
+    Always pass a list — even for a single task, send tasks=[{...}]. The
+    confirmation gate previews the whole batch and the user approves once.
+    """
+
+    tasks: list[NewTask] = Field(..., min_length=1)
+
+
+class TaskUpdate(BaseModel):
+    """One task update. Only fields you set will change. ``due=""`` clears
+    the due date. Used inside update_tasks."""
 
     page_id: str
     name: str | None = None
@@ -175,10 +187,25 @@ class UpdateTaskArgs(BaseModel):
     my_day: bool | None = None
 
 
-class CompleteTaskArgs(BaseModel):
-    """Mark a task as Done."""
+class UpdateTasksArgs(BaseModel):
+    """Update one or more tasks in a single batch.
 
-    page_id: str
+    Use this for rescheduling (set ``due``), changing priority/status/project,
+    renaming, etc. Always pass a list — even for a single update. The
+    confirmation gate previews the whole batch and the user approves once.
+    """
+
+    updates: list[TaskUpdate] = Field(..., min_length=1)
+
+
+class CompleteTasksArgs(BaseModel):
+    """Mark one or more tasks as Done in a single batch.
+
+    Always pass a list of page_ids — even for one task, send page_ids=[...].
+    The confirmation gate previews the whole batch and the user approves once.
+    """
+
+    page_ids: list[str] = Field(..., min_length=1)
 
 
 class ListProjectsArgs(BaseModel):
@@ -187,14 +214,13 @@ class ListProjectsArgs(BaseModel):
 
 class ShiftDueDatesArgs(BaseModel):
     """Shift the due date of every task matching the filter by an integer
-    number of days. Use for batch reschedules — for example 'push everything
-    from this week to next week' (delta_days=7), 'pull tomorrow back to
-    today' (delta_days=-1).
+    number of days. Use for filter-based batch reschedules — for example
+    'push everything from this week to next week' (delta_days=7), 'pull
+    tomorrow back to today' (delta_days=-1).
 
     Open tasks only — completed tasks are never shifted. Tasks with no due
     date are skipped silently. Provide at least one filter (due_on,
-    due_on_or_after, due_on_or_before, project_name, or my_day) so the shift
-    has a clear scope; an unfiltered shift across the whole DB is rejected.
+    due_on_or_after, due_on_or_before, project_name, or my_day).
     """
 
     delta_days: int = Field(
@@ -312,58 +338,98 @@ def _find_tasks_tool(args: FindTasksArgs) -> str:
     return json.dumps({"tasks": [_task_to_dict(t) for t in matched]})
 
 
-def _create_task_tool(args: CreateTaskArgs) -> str:
-    parsed_due = _parse_iso_date(args.due) if args.due else None
-    parsed_priority = Priority(args.priority) if args.priority else None
+def _resolve_create_kwargs(spec: NewTask) -> dict[str, Any]:
+    """Translate one ``NewTask`` spec into kwargs for ``create_task``.
 
+    Resolves the project name to a page_id and parses the ISO date here so
+    both the LLM-facing tool and the confirmation-gate executor share the
+    same logic.
+    """
+    parsed_due = _parse_iso_date(spec.due) if spec.due else None
+    parsed_priority = Priority(spec.priority) if spec.priority else None
     project_ids: list[str] | None = None
-    if args.project_name:
-        proj = find_project_by_name(args.project_name)
+    if spec.project_name:
+        proj = find_project_by_name(spec.project_name)
         if proj is None:
-            return json.dumps({"error": f"No project matching '{args.project_name}'."})
+            raise ValueError(f"No project matching '{spec.project_name}'.")
         project_ids = [proj.page_id]
-
-    task = create_task(
-        name=args.name,
-        description=args.description,
-        due=parsed_due,
-        priority=parsed_priority,
-        project_ids=project_ids,
-        labels=args.labels,
-        my_day=args.my_day,
-    )
-    return json.dumps({"created": _task_to_dict(task)})
+    return {
+        "name": spec.name,
+        "description": spec.description,
+        "due": parsed_due,
+        "priority": parsed_priority,
+        "project_ids": project_ids,
+        "labels": spec.labels,
+        "my_day": spec.my_day,
+    }
 
 
-def _update_task_tool(args: UpdateTaskArgs) -> str:
+def _resolve_update_kwargs(spec: TaskUpdate) -> dict[str, Any]:
+    """Translate one ``TaskUpdate`` spec into kwargs for ``update_task``."""
     kwargs: dict[str, Any] = {}
-    if args.name is not None:
-        kwargs["name"] = args.name
-    if args.description is not None:
-        kwargs["description"] = args.description
-    if args.due is not None:
-        kwargs["due"] = None if args.due == "" else _parse_iso_date(args.due)
-    if args.priority is not None:
-        kwargs["priority"] = Priority(args.priority)
-    if args.status is not None:
-        kwargs["status"] = Status(args.status)
-    if args.project_name is not None:
-        proj = find_project_by_name(args.project_name)
+    if spec.name is not None:
+        kwargs["name"] = spec.name
+    if spec.description is not None:
+        kwargs["description"] = spec.description
+    if spec.due is not None:
+        kwargs["due"] = None if spec.due == "" else _parse_iso_date(spec.due)
+    if spec.priority is not None:
+        kwargs["priority"] = Priority(spec.priority)
+    if spec.status is not None:
+        kwargs["status"] = Status(spec.status)
+    if spec.project_name is not None:
+        proj = find_project_by_name(spec.project_name)
         if proj is None:
-            return json.dumps({"error": f"No project matching '{args.project_name}'."})
+            raise ValueError(f"No project matching '{spec.project_name}'.")
         kwargs["project_ids"] = [proj.page_id]
-    if args.labels is not None:
-        kwargs["labels"] = args.labels
-    if args.my_day is not None:
-        kwargs["my_day"] = args.my_day
-
-    task = update_task(args.page_id, **kwargs)
-    return json.dumps({"updated": _task_to_dict(task)})
+    if spec.labels is not None:
+        kwargs["labels"] = spec.labels
+    if spec.my_day is not None:
+        kwargs["my_day"] = spec.my_day
+    return kwargs
 
 
-def _complete_task_tool(args: CompleteTaskArgs) -> str:
-    task = complete_task(args.page_id)
-    return json.dumps({"completed": _task_to_dict(task)})
+def execute_create_tasks(args: CreateTasksArgs) -> list[Task]:
+    """Run a confirmed create_tasks batch. Each entry is created independently;
+    a failure on one entry raises out of this function — callers wrap in
+    try/except per entry if they want partial-success semantics."""
+    return [create_task(**_resolve_create_kwargs(spec)) for spec in args.tasks]
+
+
+def execute_update_tasks(args: UpdateTasksArgs) -> list[Task]:
+    """Run a confirmed update_tasks batch."""
+    return [
+        update_task(spec.page_id, **_resolve_update_kwargs(spec))
+        for spec in args.updates
+    ]
+
+
+def execute_complete_tasks(args: CompleteTasksArgs) -> list[Task]:
+    """Run a confirmed complete_tasks batch."""
+    return [complete_task(page_id) for page_id in args.page_ids]
+
+
+# These tool entry points are called only when the confirmation gate is ever
+# bypassed. In the normal flow, ``agent/loop.py`` intercepts every write tool
+# call before execution and routes through the gate.
+
+
+def _create_tasks_tool(args: CreateTasksArgs) -> str:
+    return json.dumps(
+        {"created": [_task_to_dict(t) for t in execute_create_tasks(args)]}
+    )
+
+
+def _update_tasks_tool(args: UpdateTasksArgs) -> str:
+    return json.dumps(
+        {"updated": [_task_to_dict(t) for t in execute_update_tasks(args)]}
+    )
+
+
+def _complete_tasks_tool(args: CompleteTasksArgs) -> str:
+    return json.dumps(
+        {"completed": [_task_to_dict(t) for t in execute_complete_tasks(args)]}
+    )
 
 
 def _build_shift_filter(args: ShiftDueDatesArgs) -> dict | None:
@@ -423,14 +489,8 @@ def execute_shift_due_dates(args: ShiftDueDatesArgs) -> list[Task]:
 
 
 def _shift_due_dates_tool(args: ShiftDueDatesArgs) -> str:
-    """LLM-facing entry point. NOT called in production — the agent loop
-    intercepts ``shift_due_dates`` calls and routes them through the
-    confirmation gate before any Notion writes happen. This implementation
-    exists so the schema entry stays consistent with other write tools and
-    to keep behavior sensible if the gate is ever bypassed."""
-    updated = execute_shift_due_dates(args)
     return json.dumps(
-        {"updated": [_task_to_dict(t) for t in updated]}
+        {"updated": [_task_to_dict(t) for t in execute_shift_due_dates(args)]}
     )
 
 
@@ -446,12 +506,13 @@ def _list_projects_tool(_args: ListProjectsArgs) -> str:
 _TOOLS: dict[str, tuple[type[BaseModel], Any]] = {
     "query_tasks": (QueryTasksArgs, _query_tasks_tool),
     "find_tasks": (FindTasksArgs, _find_tasks_tool),
-    "create_task": (CreateTaskArgs, _create_task_tool),
-    "update_task": (UpdateTaskArgs, _update_task_tool),
-    "complete_task": (CompleteTaskArgs, _complete_task_tool),
+    "create_tasks": (CreateTasksArgs, _create_tasks_tool),
+    "update_tasks": (UpdateTasksArgs, _update_tasks_tool),
+    "complete_tasks": (CompleteTasksArgs, _complete_tasks_tool),
     "shift_due_dates": (ShiftDueDatesArgs, _shift_due_dates_tool),
     "list_projects": (ListProjectsArgs, _list_projects_tool),
 }
+
 
 def _build_tool_schema(
     model: type[BaseModel], tool_name: str

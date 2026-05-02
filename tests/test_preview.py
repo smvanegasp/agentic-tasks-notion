@@ -45,10 +45,13 @@ def test_is_rejection_rejects_non_no_forms():
     assert not is_rejection("cancel that one")  # has trailing words
 
 
+# ---- create_tasks preview -------------------------------------------------
+
+
 def test_format_preview_create_basic():
     from agentic_tasks.agent.preview import format_preview
 
-    plan = [{"tool": "create_task", "arguments": {"name": "Buy markers"}}]
+    plan = [{"tool": "create_tasks", "arguments": {"tasks": [{"name": "Buy markers"}]}}]
     out = format_preview(plan)
     assert "About to:" in out
     assert "Buy markers" in out
@@ -61,12 +64,16 @@ def test_format_preview_create_with_due_priority_project():
 
     plan = [
         {
-            "tool": "create_task",
+            "tool": "create_tasks",
             "arguments": {
-                "name": "Submit report",
-                "due": "2026-05-08",
-                "priority": "High",
-                "project_name": "MBA",
+                "tasks": [
+                    {
+                        "name": "Submit report",
+                        "due": "2026-05-08",
+                        "priority": "High",
+                        "project_name": "MBA",
+                    }
+                ]
             },
         }
     ]
@@ -81,10 +88,43 @@ def test_format_preview_create_with_due_priority_project():
 def test_format_preview_create_escapes_html_in_name():
     from agentic_tasks.agent.preview import format_preview
 
-    plan = [{"tool": "create_task", "arguments": {"name": "<script>alert(1)</script>"}}]
+    plan = [
+        {
+            "tool": "create_tasks",
+            "arguments": {"tasks": [{"name": "<script>alert(1)</script>"}]},
+        }
+    ]
     out = format_preview(plan)
     assert "<script>" not in out
     assert "&lt;script&gt;" in out
+
+
+def test_format_preview_create_lists_each_task_in_batch():
+    """A batch of N creates should produce N bullet lines under one header."""
+    from agentic_tasks.agent.preview import format_preview
+
+    plan = [
+        {
+            "tool": "create_tasks",
+            "arguments": {
+                "tasks": [
+                    {"name": "Task A"},
+                    {"name": "Task B"},
+                    {"name": "Task C"},
+                ]
+            },
+        }
+    ]
+    out = format_preview(plan)
+    assert out.count("About to:") == 1
+    assert "Task A" in out
+    assert "Task B" in out
+    assert "Task C" in out
+    # One y/n footer for the whole batch
+    assert out.count("<b>y</b>") == 1
+
+
+# ---- update_tasks preview -------------------------------------------------
 
 
 def test_format_preview_update_resolves_task_name():
@@ -100,8 +140,12 @@ def test_format_preview_update_resolves_task_name():
     )
     plan = [
         {
-            "tool": "update_task",
-            "arguments": {"page_id": "page-123", "due": "2026-05-05", "priority": "High"},
+            "tool": "update_tasks",
+            "arguments": {
+                "updates": [
+                    {"page_id": "page-123", "due": "2026-05-05", "priority": "High"}
+                ]
+            },
         }
     ]
     with patch("agentic_tasks.agent.preview.get_task", return_value=fake_task):
@@ -114,17 +158,59 @@ def test_format_preview_update_resolves_task_name():
 def test_format_preview_update_falls_back_when_get_task_fails():
     from agentic_tasks.agent.preview import format_preview
 
-    plan = [{"tool": "update_task", "arguments": {"page_id": "abcdef12345", "due": ""}}]
+    plan = [
+        {
+            "tool": "update_tasks",
+            "arguments": {"updates": [{"page_id": "abcdef12345", "due": ""}]},
+        }
+    ]
     with patch(
         "agentic_tasks.agent.preview.get_task", side_effect=RuntimeError("api down")
     ):
         out = format_preview(plan)
-    # Should not crash; should include a hint with the page-id prefix.
     assert "abcdef12" in out
     assert "due → cleared" in out
 
 
-def test_format_preview_complete():
+def test_format_preview_update_lists_each_in_batch():
+    """Reschedule three tasks at once — preview should list all three."""
+    from agentic_tasks.agent.preview import format_preview
+    from agentic_tasks.notion_io.tasks import Task
+
+    def fake_get(page_id):
+        return Task(
+            page_id=page_id,
+            name=f"Task {page_id[-1].upper()}",
+            status="To Do",
+            priority=None,
+            due=None,
+        )
+
+    plan = [
+        {
+            "tool": "update_tasks",
+            "arguments": {
+                "updates": [
+                    {"page_id": "p-a", "due": "2026-05-09"},
+                    {"page_id": "p-b", "due": "2026-05-09"},
+                    {"page_id": "p-c", "due": "2026-05-09"},
+                ]
+            },
+        }
+    ]
+    with patch("agentic_tasks.agent.preview.get_task", side_effect=fake_get):
+        out = format_preview(plan)
+
+    assert "Task A" in out
+    assert "Task B" in out
+    assert "Task C" in out
+    assert out.count("<b>y</b>") == 1
+
+
+# ---- complete_tasks preview ----------------------------------------------
+
+
+def test_format_preview_complete_single():
     from agentic_tasks.agent.preview import format_preview
     from agentic_tasks.notion_io.tasks import Task
 
@@ -135,11 +221,76 @@ def test_format_preview_complete():
         priority=None,
         due=None,
     )
-    plan = [{"tool": "complete_task", "arguments": {"page_id": "page-9"}}]
+    plan = [
+        {"tool": "complete_tasks", "arguments": {"page_ids": ["page-9"]}}
+    ]
     with patch("agentic_tasks.agent.preview.get_task", return_value=fake_task):
         out = format_preview(plan)
     assert "Complete" in out
     assert "Schedule Phil" in out
+
+
+def test_format_preview_complete_lists_each_in_batch():
+    from agentic_tasks.agent.preview import format_preview
+    from agentic_tasks.notion_io.tasks import Task
+
+    def fake_get(page_id):
+        return Task(
+            page_id=page_id,
+            name=f"task-{page_id}",
+            status="To Do",
+            priority=None,
+            due=None,
+        )
+
+    plan = [
+        {"tool": "complete_tasks", "arguments": {"page_ids": ["p1", "p2", "p3"]}}
+    ]
+    with patch("agentic_tasks.agent.preview.get_task", side_effect=fake_get):
+        out = format_preview(plan)
+
+    assert "task-p1" in out
+    assert "task-p2" in out
+    assert "task-p3" in out
+    assert out.count("<b>y</b>") == 1
+
+
+# ---- mixed batch (one preview, multiple actions) -------------------------
+
+
+def test_format_preview_combines_complete_and_update_under_one_header():
+    """The user's golden path: complete X AND reschedule Y in one message,
+    one preview, one confirmation."""
+    from agentic_tasks.agent.preview import format_preview
+    from agentic_tasks.notion_io.tasks import Task
+
+    def fake_get(page_id):
+        names = {"page-x": "Doctor visit", "page-y": "Cinema"}
+        return Task(
+            page_id=page_id,
+            name=names.get(page_id, "?"),
+            status="To Do",
+            priority=None,
+            due=None,
+        )
+
+    plan = [
+        {"tool": "complete_tasks", "arguments": {"page_ids": ["page-x"]}},
+        {
+            "tool": "update_tasks",
+            "arguments": {"updates": [{"page_id": "page-y", "due": "2026-05-02"}]},
+        },
+    ]
+    with patch("agentic_tasks.agent.preview.get_task", side_effect=fake_get):
+        out = format_preview(plan)
+
+    assert out.count("About to:") == 1
+    assert "Doctor visit" in out
+    assert "Cinema" in out
+    assert out.count("<b>y</b>") == 1
+
+
+# ---- serialize_plan -------------------------------------------------------
 
 
 def test_serialize_plan_keeps_only_writes():
@@ -155,13 +306,19 @@ def test_serialize_plan_keeps_only_writes():
 
     tool_calls = [
         _tc("query_tasks", '{"limit": 10}'),
-        _tc("create_task", '{"name": "X"}'),
+        _tc("create_tasks", '{"tasks": [{"name": "X"}]}'),
         _tc("list_projects", "{}"),
-        _tc("update_task", '{"page_id": "p1", "due": "2026-05-05"}'),
+        _tc(
+            "update_tasks",
+            '{"updates": [{"page_id": "p1", "due": "2026-05-05"}]}',
+        ),
     ]
     plan = serialize_plan(tool_calls)
-    assert [e["tool"] for e in plan] == ["create_task", "update_task"]
-    assert plan[0]["arguments"] == {"name": "X"}
+    assert [e["tool"] for e in plan] == ["create_tasks", "update_tasks"]
+    assert plan[0]["arguments"] == {"tasks": [{"name": "X"}]}
+
+
+# ---- execute_plan ---------------------------------------------------------
 
 
 def test_execute_plan_creates_and_returns_summary_with_link():
@@ -176,8 +333,10 @@ def test_execute_plan_creates_and_returns_summary_with_link():
         due=None,
         url="https://www.notion.so/Buy-markers-pagex",
     )
-    with patch("agentic_tasks.agent.preview.create_task", return_value=created):
-        out = execute_plan([{"tool": "create_task", "arguments": {"name": "Buy markers"}}])
+    with patch("agentic_tasks.agent.tools.create_task", return_value=created):
+        out = execute_plan(
+            [{"tool": "create_tasks", "arguments": {"tasks": [{"name": "Buy markers"}]}}]
+        )
     assert out.startswith("Done.")
     assert "Created" in out
     assert "Buy markers" in out
@@ -205,16 +364,119 @@ def test_execute_plan_handles_partial_failure():
             return good
         raise RuntimeError("notion is down")
 
-    with patch("agentic_tasks.agent.preview.create_task", side_effect=fake_create):
+    with patch("agentic_tasks.agent.tools.create_task", side_effect=fake_create):
         out = execute_plan(
             [
-                {"tool": "create_task", "arguments": {"name": "Good one"}},
-                {"tool": "create_task", "arguments": {"name": "Bad one"}},
+                {
+                    "tool": "create_tasks",
+                    "arguments": {
+                        "tasks": [{"name": "Good one"}, {"name": "Bad one"}]
+                    },
+                }
             ]
         )
     assert "Partial. 1 done, 1 failed." in out
     assert "Good one" in out
     assert "notion is down" in out
+
+
+def test_execute_plan_completes_each_in_batch():
+    """Mark three tasks as Done in one confirmed plan."""
+    from agentic_tasks.agent.preview import execute_plan
+    from agentic_tasks.notion_io.tasks import Task
+
+    def fake_complete(page_id):
+        return Task(
+            page_id=page_id,
+            name=f"task-{page_id}",
+            status="Done",
+            priority=None,
+            due=None,
+            url=f"https://www.notion.so/{page_id}",
+        )
+
+    with patch(
+        "agentic_tasks.agent.tools.complete_task", side_effect=fake_complete
+    ) as mock_complete:
+        out = execute_plan(
+            [{"tool": "complete_tasks", "arguments": {"page_ids": ["p1", "p2", "p3"]}}]
+        )
+
+    assert mock_complete.call_count == 3
+    assert out.startswith("Done.")
+    assert out.count("Completed") == 3
+
+
+def test_execute_plan_updates_each_in_batch():
+    """Reschedule three tasks in one confirmed plan."""
+    from agentic_tasks.agent.preview import execute_plan
+    from agentic_tasks.notion_io.tasks import Task
+
+    def fake_update(page_id, **_kw):
+        return Task(
+            page_id=page_id,
+            name=f"task-{page_id}",
+            status="To Do",
+            priority=None,
+            due=date(2026, 5, 9),
+        )
+
+    plan = [
+        {
+            "tool": "update_tasks",
+            "arguments": {
+                "updates": [
+                    {"page_id": "p1", "due": "2026-05-09"},
+                    {"page_id": "p2", "due": "2026-05-09"},
+                    {"page_id": "p3", "due": "2026-05-09"},
+                ]
+            },
+        }
+    ]
+    with patch(
+        "agentic_tasks.agent.tools.update_task", side_effect=fake_update
+    ) as mock_update:
+        out = execute_plan(plan)
+
+    assert mock_update.call_count == 3
+    assert out.count("Updated") == 3
+
+
+def test_execute_plan_runs_combined_complete_and_update():
+    """One pending plan can include multiple batch tools — execute all."""
+    from agentic_tasks.agent.preview import execute_plan
+    from agentic_tasks.notion_io.tasks import Task
+
+    def fake_complete(page_id):
+        return Task(
+            page_id=page_id, name=f"done-{page_id}", status="Done",
+            priority=None, due=None,
+        )
+
+    def fake_update(page_id, **_kw):
+        return Task(
+            page_id=page_id, name=f"upd-{page_id}", status="To Do",
+            priority=None, due=date(2026, 5, 2),
+        )
+
+    plan = [
+        {"tool": "complete_tasks", "arguments": {"page_ids": ["x"]}},
+        {
+            "tool": "update_tasks",
+            "arguments": {"updates": [{"page_id": "y", "due": "2026-05-02"}]},
+        },
+    ]
+    with patch("agentic_tasks.agent.tools.complete_task", side_effect=fake_complete), \
+         patch("agentic_tasks.agent.tools.update_task", side_effect=fake_update):
+        out = execute_plan(plan)
+
+    assert "Completed" in out
+    assert "Updated" in out
+    assert "done-x" in out
+    assert "upd-y" in out
+
+
+# ---- date helpers ---------------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -232,9 +494,18 @@ def test_format_date_human_friendly_format(iso, expected_substr):
     assert expected_substr in _format_date_human(iso, today)
 
 
+def test_format_date_human_today_and_tomorrow():
+    from agentic_tasks.agent.preview import _format_date_human
+
+    today = date(2026, 5, 1)
+    assert _format_date_human("2026-05-01", today) == "today"
+    assert _format_date_human("2026-05-02", today) == "tomorrow"
+
+
+# ---- shift_due_dates preview / execute -----------------------------------
+
+
 def test_format_preview_shift_due_dates_lists_each_task():
-    """The shift preview resolves the filter against Notion at preview time
-    and lists each affected task with old → new dates."""
     from datetime import date as _date
 
     from agentic_tasks.agent.preview import format_preview
@@ -275,7 +546,12 @@ def test_format_preview_shift_due_dates_lists_each_task():
 def test_format_preview_shift_due_dates_handles_no_matches():
     from agentic_tasks.agent.preview import format_preview
 
-    plan = [{"tool": "shift_due_dates", "arguments": {"delta_days": 1, "due_on": "2026-05-01"}}]
+    plan = [
+        {
+            "tool": "shift_due_dates",
+            "arguments": {"delta_days": 1, "due_on": "2026-05-01"},
+        }
+    ]
     with patch("agentic_tasks.agent.preview.resolve_shift_targets", return_value=[]):
         out = format_preview(plan)
     assert "no matching open tasks" in out
@@ -311,17 +587,14 @@ def test_execute_plan_shift_due_dates_flattens_results():
         return_value=shifted,
     ):
         out = execute_plan(
-            [{"tool": "shift_due_dates", "arguments": {"delta_days": 7, "due_on": "2026-05-01"}}]
+            [
+                {
+                    "tool": "shift_due_dates",
+                    "arguments": {"delta_days": 7, "due_on": "2026-05-01"},
+                }
+            ]
         )
     assert "Done." in out
     assert out.count("Shifted") == 2
     assert "A" in out
     assert "B" in out
-
-
-def test_format_date_human_today_and_tomorrow():
-    from agentic_tasks.agent.preview import _format_date_human
-
-    today = date(2026, 5, 1)
-    assert _format_date_human("2026-05-01", today) == "today"
-    assert _format_date_human("2026-05-02", today) == "tomorrow"
