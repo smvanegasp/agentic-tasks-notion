@@ -297,7 +297,10 @@ def _resolve_task_name(page_id: str) -> str:
 
 
 def _format_date_human(iso_value: str, today: date) -> str:
-    """ISO 8601 → 'Friday, May 1' / 'Friday, May 1 at 5 PM' / 'today' / 'tomorrow'."""
+    """ISO 8601 → 'today (May 3)' / 'tomorrow (May 4)' / 'Friday, May 1' /
+    'Friday, May 1 at 5 PM'. The year is appended only when ``d`` is not in
+    the current calendar year, so far-future tasks stay readable while
+    near-term ones don't repeat the obvious."""
     try:
         if "T" not in iso_value:
             d = date.fromisoformat(iso_value)
@@ -309,11 +312,14 @@ def _format_date_human(iso_value: str, today: date) -> str:
 
 
 def _format_date_only(d: date, today: date) -> str:
+    month_day = f"{d.strftime('%B')} {d.day}"
+    if d.year != today.year:
+        month_day = f"{month_day}, {d.year}"
     if d == today:
-        return "today"
+        return f"today ({month_day})"
     if d == today + timedelta(days=1):
-        return "tomorrow"
-    return f"{d.strftime('%A')}, {d.strftime('%B')} {d.day}"
+        return f"tomorrow ({month_day})"
+    return f"{d.strftime('%A')}, {month_day}"
 
 
 def _format_time(dt: datetime) -> str:

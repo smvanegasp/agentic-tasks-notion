@@ -629,8 +629,16 @@ def test_format_date_human_today_and_tomorrow():
     from agentic_tasks.agent.preview import _format_date_human
 
     today = date(2026, 5, 1)
-    assert _format_date_human("2026-05-01", today) == "today"
-    assert _format_date_human("2026-05-02", today) == "tomorrow"
+    assert _format_date_human("2026-05-01", today) == "today (May 1)"
+    assert _format_date_human("2026-05-02", today) == "tomorrow (May 2)"
+
+
+def test_format_date_human_appends_year_when_not_current():
+    from agentic_tasks.agent.preview import _format_date_human
+
+    today = date(2026, 5, 1)
+    assert _format_date_human("2027-06-01", today) == "Tuesday, June 1, 2027"
+    assert _format_date_human("2026-12-31", today) == "Thursday, December 31"
 
 
 # ---- shift_due_dates preview / execute -----------------------------------
