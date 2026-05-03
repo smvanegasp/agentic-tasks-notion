@@ -5,6 +5,7 @@ from agentic_tasks.notion_io.schema import Priority, Status
 from agentic_tasks.notion_io.tasks import (
     complete_task,
     create_task,
+    delete_task,
     query_tasks,
     query_today,
     update_task,
@@ -192,3 +193,41 @@ def test_set_status_via_update(mock_get_client):
 
     props = mock_client.pages.update.call_args.kwargs["properties"]
     assert props["Status"]["status"]["name"] == "Doing"
+
+
+@patch("agentic_tasks.notion_io.tasks.get_client")
+def test_delete_task_sets_in_trash(mock_get_client):
+    """``in_trash=True`` is the documented spelling for the 2025-09-03 API
+    that notion-client 3.x pins. The legacy ``archived`` field is no longer
+    honored on every code path."""
+    trashed_page = _fake_page()
+    trashed_page["in_trash"] = True
+    mock_client = MagicMock()
+    mock_client.pages.update.return_value = trashed_page
+    mock_get_client.return_value = mock_client
+
+    task = delete_task("page-id-1")
+
+    update_kwargs = mock_client.pages.update.call_args.kwargs
+    assert update_kwargs["page_id"] == "page-id-1"
+    assert update_kwargs["in_trash"] is True
+    assert "archived" not in update_kwargs
+    assert "properties" not in update_kwargs
+    assert task.archived is True
+    assert task.url == "https://notion.so/page-1"
+
+
+@patch("agentic_tasks.notion_io.tasks.get_client")
+def test_delete_task_parses_in_trash_field(mock_get_client):
+    """The newer Notion API returns ``in_trash`` instead of ``archived``;
+    Task.archived should reflect either."""
+    page = _fake_page()
+    page.pop("archived", None)
+    page["in_trash"] = True
+    mock_client = MagicMock()
+    mock_client.pages.update.return_value = page
+    mock_get_client.return_value = mock_client
+
+    task = delete_task("page-id-1")
+
+    assert task.archived is True

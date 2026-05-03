@@ -8,10 +8,11 @@ The function appends the new user message to the model's messages internally,
 runs the tool-call loop, and returns ``(reply_text, agent_messages, pending_plan)``.
 
 If the model emits any write tool call (``create_tasks`` / ``update_tasks`` /
-``complete_tasks`` / ``shift_due_dates``), the loop short-circuits the round,
-returns a deterministic preview, and ``pending_plan`` carries the plan the
-caller should persist for the confirmation gate. Reads in the same round are
-dropped — the model can re-issue them next turn.
+``complete_tasks`` / ``delete_tasks`` / ``shift_due_dates``), the loop
+short-circuits the round, returns a deterministic preview, and
+``pending_plan`` carries the plan the caller should persist for the
+confirmation gate. Reads in the same round are dropped — the model can
+re-issue them next turn.
 """
 
 from __future__ import annotations
@@ -440,8 +441,9 @@ def run_agent(
                                 " write tool call. Do not write previews"
                                 " yourself. Emit the actual write tool call"
                                 " (create_tasks / update_tasks /"
-                                " complete_tasks / shift_due_dates) now,"
-                                " with no chat text alongside it."
+                                " complete_tasks / delete_tasks /"
+                                " shift_due_dates) now, with no chat text"
+                                " alongside it."
                             ),
                         }
                     )

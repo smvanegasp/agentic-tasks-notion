@@ -30,6 +30,7 @@ from agentic_tasks.notion_io.tasks import (
     Task,
     complete_task,
     create_task,
+    delete_task,
     query_tasks,
     update_task,
 )
@@ -203,6 +204,19 @@ class CompleteTasksArgs(BaseModel):
 
     Always pass a list of page_ids — even for one task, send page_ids=[...].
     The confirmation gate previews the whole batch and the user approves once.
+    """
+
+    page_ids: list[str] = Field(..., min_length=1)
+
+
+class DeleteTasksArgs(BaseModel):
+    """Move one or more tasks to Notion's Trash in a single batch.
+
+    Use this when the user wants to ELIMINATE a task entirely (delete /
+    remove / borrar / eliminar), NOT when they want to mark it as Done —
+    that's complete_tasks. Always pass a list of page_ids — even for one
+    task, send page_ids=[...]. The confirmation gate previews the whole
+    batch and the user approves once.
     """
 
     page_ids: list[str] = Field(..., min_length=1)
@@ -409,6 +423,11 @@ def execute_complete_tasks(args: CompleteTasksArgs) -> list[Task]:
     return [complete_task(page_id) for page_id in args.page_ids]
 
 
+def execute_delete_tasks(args: DeleteTasksArgs) -> list[Task]:
+    """Run a confirmed delete_tasks batch."""
+    return [delete_task(page_id) for page_id in args.page_ids]
+
+
 # These tool entry points are called only when the confirmation gate is ever
 # bypassed. In the normal flow, ``agent/loop.py`` intercepts every write tool
 # call before execution and routes through the gate.
@@ -429,6 +448,12 @@ def _update_tasks_tool(args: UpdateTasksArgs) -> str:
 def _complete_tasks_tool(args: CompleteTasksArgs) -> str:
     return json.dumps(
         {"completed": [_task_to_dict(t) for t in execute_complete_tasks(args)]}
+    )
+
+
+def _delete_tasks_tool(args: DeleteTasksArgs) -> str:
+    return json.dumps(
+        {"deleted": [_task_to_dict(t) for t in execute_delete_tasks(args)]}
     )
 
 
@@ -509,6 +534,7 @@ _TOOLS: dict[str, tuple[type[BaseModel], Any]] = {
     "create_tasks": (CreateTasksArgs, _create_tasks_tool),
     "update_tasks": (UpdateTasksArgs, _update_tasks_tool),
     "complete_tasks": (CompleteTasksArgs, _complete_tasks_tool),
+    "delete_tasks": (DeleteTasksArgs, _delete_tasks_tool),
     "shift_due_dates": (ShiftDueDatesArgs, _shift_due_dates_tool),
     "list_projects": (ListProjectsArgs, _list_projects_tool),
 }

@@ -17,6 +17,7 @@ import json
 import logging
 import re
 import time
+from collections.abc import Callable
 from datetime import date, datetime, timedelta
 from typing import Any
 
@@ -25,6 +26,7 @@ from pydantic import ValidationError
 from agentic_tasks.agent.tools import (
     CompleteTasksArgs,
     CreateTasksArgs,
+    DeleteTasksArgs,
     NewTask,
     ShiftDueDatesArgs,
     TaskUpdate,
@@ -32,6 +34,7 @@ from agentic_tasks.agent.tools import (
     _parse_iso_date,
     execute_complete_tasks,
     execute_create_tasks,
+    execute_delete_tasks,
     execute_shift_due_dates,
     execute_update_tasks,
     resolve_shift_targets,
@@ -42,7 +45,13 @@ from agentic_tasks.notion_io.tasks import Task, get_task
 log = logging.getLogger(__name__)
 
 WRITE_TOOL_NAMES = frozenset(
-    {"create_tasks", "update_tasks", "complete_tasks", "shift_due_dates"}
+    {
+        "create_tasks",
+        "update_tasks",
+        "complete_tasks",
+        "delete_tasks",
+        "shift_due_dates",
+    }
 )
 
 # Each individual mutation gets re-attempted on failure (exception OR
@@ -51,6 +60,24 @@ WRITE_TOOL_NAMES = frozenset(
 # flakes without needing another LLM round-trip.
 MAX_MUTATION_ATTEMPTS = 3
 _RETRY_BACKOFF_SECONDS = 0.3
+
+
+def _sanitize_notion_error(e: Exception) -> str:
+    """Translate a Notion / SDK exception into one short, ID-free sentence
+    for the user. The raw Notion error mentions the page UUID, the
+    integration name, and tells the user to "share pages with your
+    integration" — none of that belongs in the chat reply.
+    """
+    msg = str(e).lower()
+    if "could not find" in msg or "object_not_found" in msg or "not_found" in msg:
+        return "Notion couldn't find this page (it may have been deleted or moved)."
+    if "unauthorized" in msg or "restricted_resource" in msg or "permission" in msg:
+        return "Notion denied access to this page."
+    if "rate" in msg and "limit" in msg:
+        return "Notion is rate-limiting us — try again in a moment."
+    if "validation" in msg or "invalid" in msg:
+        return "Notion rejected the request as invalid."
+    return "something went wrong on Notion's side."
 
 _CONFIRM_RE = re.compile(
     r"^\s*(y|yes|yeah|yep|sí|si|ok|okay|sure|👍)\s*[!.]?\s*$",
@@ -111,6 +138,8 @@ def format_preview(plan: list[dict[str, Any]]) -> str:
             lines.extend(_format_update_lines(args, today))
         elif tool == "complete_tasks":
             lines.extend(_format_complete_lines(args))
+        elif tool == "delete_tasks":
+            lines.extend(_format_delete_lines(args))
         elif tool == "shift_due_dates":
             lines.extend(_format_shift_lines(args, today))
         else:
@@ -198,6 +227,16 @@ def _format_complete_lines(args_dict: dict[str, Any]) -> list[str]:
     ]
 
 
+def _format_delete_lines(args_dict: dict[str, Any]) -> list[str]:
+    try:
+        args = DeleteTasksArgs.model_validate(args_dict)
+    except ValidationError as e:
+        return [f"• delete_tasks: invalid args ({html.escape(str(e))})"]
+    return [
+        f'• Delete "{_resolve_task_name(page_id)}"' for page_id in args.page_ids
+    ]
+
+
 def _format_shift_lines(args_dict: dict[str, Any], today: date) -> list[str]:
     """Build the multi-line preview for a shift_due_dates plan entry.
 
@@ -234,20 +273,27 @@ def _format_shift_lines(args_dict: dict[str, Any], today: date) -> list[str]:
     return lines
 
 
+_UNRESOLVED_TASK_LABEL = "this task"
+
+
 def _resolve_task_name(page_id: str) -> str:
     """Look up a Notion page and return its HTML-escaped title.
 
-    Falls back to a short page-id hint if the lookup fails so the preview
-    still renders.
+    Falls back to a neutral phrase ("this task") when the lookup fails —
+    the page_id is an internal identifier and must never appear in
+    user-facing text. Failures here usually mean the page is no longer
+    reachable (deleted, moved, model emitted a stale id) — we still want
+    the preview / summary to render rather than crash, but the user
+    shouldn't see the raw uuid.
     """
     if not page_id:
-        return "(unknown task)"
+        return _UNRESOLVED_TASK_LABEL
     try:
         task = get_task(page_id)
     except Exception as e:  # noqa: BLE001
         log.warning("preview: get_task(%s) failed: %s", page_id, e)
-        return f"(task {html.escape(page_id[:8])})"
-    return html.escape(task.name) if task.name else "(no title)"
+        return _UNRESOLVED_TASK_LABEL
+    return html.escape(task.name) if task.name else _UNRESOLVED_TASK_LABEL
 
 
 def _format_date_human(iso_value: str, today: date) -> str:
@@ -299,6 +345,8 @@ def execute_plan(plan: list[dict[str, Any]]) -> str:
             _run_update_batch(args, successes, errors)
         elif tool == "complete_tasks":
             _run_complete_batch(args, successes, errors)
+        elif tool == "delete_tasks":
+            _run_delete_batch(args, successes, errors)
         elif tool == "shift_due_dates":
             _run_shift_batch(args, successes, errors)
         else:
@@ -317,10 +365,15 @@ def _run_create_batch(
         errors.append(f"invalid create_tasks args: {html.escape(str(e))}")
         return
     for spec in args.tasks:
+        name = html.escape(spec.name) if spec.name else _UNRESOLVED_TASK_LABEL
+
+        def _label(name: str = name) -> str:
+            return f'Couldn\'t create "{name}"'
+
         task, error = _attempt_with_retry(
             do=lambda spec=spec: execute_create_tasks(CreateTasksArgs(tasks=[spec]))[0],
             verify=lambda task, spec=spec: _verify_create(spec, task),
-            label=f'create "{spec.name}"',
+            label_fn=_label,
         )
         if task is not None:
             successes.append(("Created", task))
@@ -339,10 +392,15 @@ def _run_update_batch(
         errors.append(f"invalid update_tasks args: {html.escape(str(e))}")
         return
     for spec in args.updates:
+
+        def _label(spec: TaskUpdate = spec) -> str:
+            return f'Couldn\'t update "{_resolve_task_name(spec.page_id)}"'
+
         task, error = _attempt_with_retry(
             do=lambda spec=spec: execute_update_tasks(UpdateTasksArgs(updates=[spec]))[0],
             verify=lambda task, spec=spec: _verify_update(spec, task),
-            label=f"update {spec.page_id[:8]}",
+            label_fn=_label,
+            log_id=spec.page_id[:8],
         )
         if task is not None:
             successes.append(("Updated", task))
@@ -361,15 +419,49 @@ def _run_complete_batch(
         errors.append(f"invalid complete_tasks args: {html.escape(str(e))}")
         return
     for page_id in args.page_ids:
+
+        def _label(page_id: str = page_id) -> str:
+            return f'Couldn\'t complete "{_resolve_task_name(page_id)}"'
+
         task, error = _attempt_with_retry(
             do=lambda page_id=page_id: execute_complete_tasks(
                 CompleteTasksArgs(page_ids=[page_id])
             )[0],
             verify=_verify_complete,
-            label=f"complete {page_id[:8]}",
+            label_fn=_label,
+            log_id=page_id[:8],
         )
         if task is not None:
             successes.append(("Completed", task))
+        else:
+            errors.append(error)
+
+
+def _run_delete_batch(
+    args_dict: dict[str, Any],
+    successes: list[tuple[str, Task]],
+    errors: list[str],
+) -> None:
+    try:
+        args = DeleteTasksArgs.model_validate(args_dict)
+    except ValidationError as e:
+        errors.append(f"invalid delete_tasks args: {html.escape(str(e))}")
+        return
+    for page_id in args.page_ids:
+
+        def _label(page_id: str = page_id) -> str:
+            return f'Couldn\'t delete "{_resolve_task_name(page_id)}"'
+
+        task, error = _attempt_with_retry(
+            do=lambda page_id=page_id: execute_delete_tasks(
+                DeleteTasksArgs(page_ids=[page_id])
+            )[0],
+            verify=_verify_delete,
+            label_fn=_label,
+            log_id=page_id[:8],
+        )
+        if task is not None:
+            successes.append(("Deleted", task))
         else:
             errors.append(error)
 
@@ -381,10 +473,19 @@ def _attempt_with_retry(
     *,
     do: Any,
     verify: Any,
-    label: str,
+    label_fn: Callable[[], str],
+    log_id: str = "",
 ) -> tuple[Task | None, str]:
     """Run a single mutation up to MAX_MUTATION_ATTEMPTS times, verifying the
     returned page after each successful call.
+
+    ``label_fn`` is invoked only when an error message is actually built —
+    so the success path doesn't pay the extra Notion lookup needed to
+    render the task's name. The returned phrase is user-facing and must
+    never contain raw page ids or scary backend text; verbose Notion
+    errors are funnelled through :func:`_sanitize_notion_error` before
+    being shown. ``log_id`` is the short page-id prefix, used only in
+    server logs for debugging.
 
     A retry is triggered by either an exception OR a verification mismatch
     (the page came back but the field we asked to change didn't actually
@@ -392,18 +493,16 @@ def _attempt_with_retry(
     caller can append it to the error list and surface it honestly to the
     user instead of claiming "Done."
     """
-    last_error = f"{label} failed"
+    last_error = ""
     for attempt in range(1, MAX_MUTATION_ATTEMPTS + 1):
         try:
             task = do()
         except Exception as e:  # noqa: BLE001
             log.warning(
-                "%s attempt %d/%d raised: %s",
-                label, attempt, MAX_MUTATION_ATTEMPTS, e,
+                "[%s] attempt %d/%d raised: %s",
+                log_id, attempt, MAX_MUTATION_ATTEMPTS, e,
             )
-            last_error = (
-                f"{html.escape(label)} failed: {html.escape(str(e))}"
-            )
+            last_error = f"{label_fn()}: {_sanitize_notion_error(e)}"
             if attempt < MAX_MUTATION_ATTEMPTS:
                 time.sleep(_RETRY_BACKOFF_SECONDS * attempt)
             continue
@@ -411,16 +510,16 @@ def _attempt_with_retry(
         mismatch = verify(task)
         if mismatch is None:
             if attempt > 1:
-                log.info("%s succeeded on attempt %d", label, attempt)
+                log.info("[%s] succeeded on attempt %d", log_id, attempt)
             return task, ""
 
         log.warning(
-            "%s attempt %d/%d verification failed: %s",
-            label, attempt, MAX_MUTATION_ATTEMPTS, mismatch,
+            "[%s] attempt %d/%d verification failed: %s",
+            log_id, attempt, MAX_MUTATION_ATTEMPTS, mismatch,
         )
         last_error = (
-            f"{html.escape(label)} did not land cleanly"
-            f" ({html.escape(mismatch)}). Please check Notion."
+            f"{label_fn()}: the change didn't land in Notion."
+            " Please check the page."
         )
         if attempt < MAX_MUTATION_ATTEMPTS:
             time.sleep(_RETRY_BACKOFF_SECONDS * attempt)
@@ -478,6 +577,12 @@ def _verify_update(spec: TaskUpdate, returned: Task) -> str | None:
 def _verify_complete(returned: Task) -> str | None:
     if returned.status != "Done":
         return f"status → {returned.status!r}"
+    return None
+
+
+def _verify_delete(returned: Task) -> str | None:
+    if not returned.archived:
+        return "still not archived"
     return None
 
 

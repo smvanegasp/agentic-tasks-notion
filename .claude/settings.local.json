@@ -1,7 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "Bash(uv run *)"
+      "Bash(uv run *)",
+      "Bash(uv pip *)",
+      "WebFetch(domain:developers.notion.com)"
     ]
   }
 }

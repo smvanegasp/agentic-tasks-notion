@@ -8,6 +8,19 @@ from unittest.mock import patch
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _stub_get_task(monkeypatch):
+    """Default: ``get_task`` raises so ``_resolve_task_name`` falls back to
+    "this task". Tests that need a real resolved name patch get_task
+    explicitly inside the test body — those overrides win over this stub
+    because ``with patch(...)`` re-binds the same module attribute."""
+
+    def _raise(page_id):
+        raise RuntimeError(f"get_task not stubbed for {page_id}")
+
+    monkeypatch.setattr("agentic_tasks.agent.preview.get_task", _raise)
+
+
 def test_is_confirmation_matches_common_yes_forms():
     from agentic_tasks.agent.preview import is_confirmation
 
@@ -156,6 +169,8 @@ def test_format_preview_update_resolves_task_name():
 
 
 def test_format_preview_update_falls_back_when_get_task_fails():
+    """When get_task fails (page deleted, stale id, permissions), the
+    preview must NOT leak the page id — we show a neutral phrase instead."""
     from agentic_tasks.agent.preview import format_preview
 
     plan = [
@@ -168,7 +183,8 @@ def test_format_preview_update_falls_back_when_get_task_fails():
         "agentic_tasks.agent.preview.get_task", side_effect=RuntimeError("api down")
     ):
         out = format_preview(plan)
-    assert "abcdef12" in out
+    assert "abcdef12" not in out
+    assert "this task" in out
     assert "due → cleared" in out
 
 
@@ -253,6 +269,50 @@ def test_format_preview_complete_lists_each_in_batch():
     assert "task-p2" in out
     assert "task-p3" in out
     assert out.count("<b>y</b>") == 1
+
+
+# ---- delete_tasks preview ------------------------------------------------
+
+
+def test_format_preview_delete_resolves_task_name():
+    from agentic_tasks.agent.preview import format_preview
+    from agentic_tasks.notion_io.tasks import Task
+
+    fake_task = Task(
+        page_id="page-9",
+        name="Old reminder",
+        status="To Do",
+        priority=None,
+        due=None,
+    )
+    plan = [{"tool": "delete_tasks", "arguments": {"page_ids": ["page-9"]}}]
+    with patch("agentic_tasks.agent.preview.get_task", return_value=fake_task):
+        out = format_preview(plan)
+    assert "Delete" in out
+    assert "Old reminder" in out
+
+
+def test_format_preview_delete_lists_each_in_batch():
+    from agentic_tasks.agent.preview import format_preview
+    from agentic_tasks.notion_io.tasks import Task
+
+    def fake_get(page_id):
+        return Task(
+            page_id=page_id,
+            name=f"task-{page_id}",
+            status="To Do",
+            priority=None,
+            due=None,
+        )
+
+    plan = [{"tool": "delete_tasks", "arguments": {"page_ids": ["p1", "p2"]}}]
+    with patch("agentic_tasks.agent.preview.get_task", side_effect=fake_get):
+        out = format_preview(plan)
+
+    assert "task-p1" in out
+    assert "task-p2" in out
+    assert out.count("<b>y</b>") == 1
+    assert out.count("About to:") == 1
 
 
 # ---- mixed batch (one preview, multiple actions) -------------------------
@@ -377,7 +437,65 @@ def test_execute_plan_handles_partial_failure():
         )
     assert "Partial. 1 done, 1 failed." in out
     assert "Good one" in out
-    assert "notion is down" in out
+    # The verbose Notion exception text is sanitized — the user sees a
+    # short clean phrase, not the raw ``str(e)``.
+    assert "notion is down" not in out
+    assert "Couldn't create" in out
+    assert "Bad one" in out
+
+
+def test_execute_plan_deletes_and_returns_summary_with_link():
+    """Deleted (archived) task still returns its URL — preserve it in the
+    summary so the user can navigate to the trashed page in Notion."""
+    from agentic_tasks.agent.preview import execute_plan
+    from agentic_tasks.notion_io.tasks import Task
+
+    archived = Task(
+        page_id="page-x",
+        name="Old reminder",
+        status="To Do",
+        priority=None,
+        due=None,
+        url="https://www.notion.so/Old-reminder-pagex",
+        archived=True,
+    )
+    with patch("agentic_tasks.agent.tools.delete_task", return_value=archived):
+        out = execute_plan(
+            [{"tool": "delete_tasks", "arguments": {"page_ids": ["page-x"]}}]
+        )
+    assert out.startswith("Done.")
+    assert "Deleted" in out
+    assert "Old reminder" in out
+    assert (
+        '<a href="https://www.notion.so/Old-reminder-pagex">open</a>' in out
+    )
+
+
+def test_execute_plan_deletes_each_in_batch():
+    from agentic_tasks.agent.preview import execute_plan
+    from agentic_tasks.notion_io.tasks import Task
+
+    def fake_delete(page_id):
+        return Task(
+            page_id=page_id,
+            name=f"task-{page_id}",
+            status="To Do",
+            priority=None,
+            due=None,
+            url=f"https://www.notion.so/{page_id}",
+            archived=True,
+        )
+
+    with patch(
+        "agentic_tasks.agent.tools.delete_task", side_effect=fake_delete
+    ) as mock_delete:
+        out = execute_plan(
+            [{"tool": "delete_tasks", "arguments": {"page_ids": ["p1", "p2", "p3"]}}]
+        )
+
+    assert mock_delete.call_count == 3
+    assert out.startswith("Done.")
+    assert out.count("Deleted") == 3
 
 
 def test_execute_plan_completes_each_in_batch():
@@ -610,21 +728,24 @@ def test_execute_plan_retries_when_update_did_not_land(_no_retry_sleep):
 
 def test_execute_plan_surfaces_persistent_verification_mismatch(_no_retry_sleep):
     """If verification fails on every attempt, the user sees an honest
-    'did not land cleanly' error, NOT a fake 'Done.'"""
+    'didn't land in Notion' error, NOT a fake 'Done.' — and the failure
+    line uses the task's NAME, never the page id."""
     from datetime import date as _date
 
     from agentic_tasks.agent.preview import execute_plan
     from agentic_tasks.notion_io.tasks import Task
 
+    stuck = Task(
+        page_id="p1",
+        name="Stuck task",
+        status="To Do",
+        priority=None,
+        due=_date(2026, 4, 1),
+    )
+
     def fake_update(page_id, **_kw):
         # Always returns the page WITHOUT the requested due change.
-        return Task(
-            page_id=page_id,
-            name="Stuck task",
-            status="To Do",
-            priority=None,
-            due=_date(2026, 4, 1),
-        )
+        return stuck
 
     plan = [
         {
@@ -636,13 +757,17 @@ def test_execute_plan_surfaces_persistent_verification_mismatch(_no_retry_sleep)
     ]
     with patch(
         "agentic_tasks.agent.tools.update_task", side_effect=fake_update
-    ) as mock_update:
+    ) as mock_update, patch(
+        "agentic_tasks.agent.preview.get_task", return_value=stuck
+    ):
         out = execute_plan(plan)
 
     assert mock_update.call_count == 3  # MAX_MUTATION_ATTEMPTS
     assert "Failed." in out
-    assert "did not land cleanly" in out
-    assert "Please check Notion" in out
+    assert "Couldn't update" in out
+    assert "Stuck task" in out
+    assert "didn't land in Notion" in out
+    assert "Please check the page" in out
 
 
 def test_execute_plan_retries_complete_until_status_is_done(_no_retry_sleep):
@@ -675,6 +800,156 @@ def test_execute_plan_retries_complete_until_status_is_done(_no_retry_sleep):
     assert calls["n"] == 2
     assert out.startswith("Done.")
     assert "Pay rent" in out
+
+
+def test_execute_plan_retries_delete_until_archived(_no_retry_sleep):
+    """If the first attempt comes back with archived=False (silent no-op),
+    retry until the page actually goes to trash."""
+    from agentic_tasks.agent.preview import execute_plan
+    from agentic_tasks.notion_io.tasks import Task
+
+    calls = {"n": 0}
+
+    def fake_delete(page_id):
+        calls["n"] += 1
+        archived = calls["n"] >= 2
+        return Task(
+            page_id=page_id,
+            name="Stuck delete",
+            status="To Do",
+            priority=None,
+            due=None,
+            url="https://www.notion.so/Stuck-delete",
+            archived=archived,
+        )
+
+    with patch("agentic_tasks.agent.tools.delete_task", side_effect=fake_delete):
+        out = execute_plan(
+            [{"tool": "delete_tasks", "arguments": {"page_ids": ["p1"]}}]
+        )
+
+    assert calls["n"] == 2
+    assert out.startswith("Done.")
+    assert "Stuck delete" in out
+
+
+def test_execute_plan_delete_clean_summary_on_object_not_found(_no_retry_sleep):
+    """Reproduces the production failure: Notion returns the verbose
+    ``Could not find page with ID: <uuid>. Make sure the relevant pages
+    and databases are shared with your integration "agentic-tasks-bot"``
+    error. The summary must show the task NAME (not the uuid) and a clean
+    sanitized reason — never the raw integration name or the scary share
+    instructions."""
+    from agentic_tasks.agent.preview import execute_plan
+    from agentic_tasks.notion_io.tasks import Task
+
+    page_id = "355cdbaa-bf8d-81e0-978f-e04e13adec5b"
+    notion_error = (
+        f"Could not find page with ID: {page_id}. Make sure the relevant"
+        ' pages and databases are shared with your integration'
+        ' "agentic-tasks-bot".'
+    )
+
+    def fake_delete(_page_id):
+        raise RuntimeError(notion_error)
+
+    resolved = Task(
+        page_id=page_id,
+        name="TRY TASK",
+        status="To Do",
+        priority=None,
+        due=None,
+    )
+
+    with patch("agentic_tasks.agent.tools.delete_task", side_effect=fake_delete), \
+         patch("agentic_tasks.agent.preview.get_task", return_value=resolved):
+        out = execute_plan(
+            [{"tool": "delete_tasks", "arguments": {"page_ids": [page_id]}}]
+        )
+
+    assert "Failed." in out
+    assert 'Couldn\'t delete "TRY TASK"' in out
+    assert "Notion couldn't find this page" in out
+    # No id leak, no integration name leak, no scary share instructions.
+    assert page_id not in out
+    assert "355cdbaa" not in out
+    assert "agentic-tasks-bot" not in out
+    assert "Make sure the relevant pages" not in out
+
+
+def test_execute_plan_delete_falls_back_to_neutral_label(_no_retry_sleep):
+    """When ``get_task`` itself also fails (the production case — the
+    page_id is unreachable), the failure label uses "this task" and still
+    avoids leaking the page_id."""
+    from agentic_tasks.agent.preview import execute_plan
+
+    page_id = "355cdbaa-bf8d-81e0-978f-e04e13adec5b"
+
+    def fake_delete(_page_id):
+        raise RuntimeError(f"Could not find page with ID: {page_id}.")
+
+    # Note: the autouse _stub_get_task fixture already makes get_task raise.
+    with patch("agentic_tasks.agent.tools.delete_task", side_effect=fake_delete):
+        out = execute_plan(
+            [{"tool": "delete_tasks", "arguments": {"page_ids": [page_id]}}]
+        )
+
+    assert "Failed." in out
+    assert 'Couldn\'t delete "this task"' in out
+    assert "Notion couldn't find this page" in out
+    assert page_id not in out
+    assert "355cdbaa" not in out
+
+
+def test_sanitize_notion_error_maps_known_phrases():
+    from agentic_tasks.agent.preview import _sanitize_notion_error
+
+    cases = [
+        (
+            RuntimeError("Could not find page with ID: abc-def. Make sure..."),
+            "couldn't find",
+        ),
+        (RuntimeError("APIResponseError: object_not_found"), "couldn't find"),
+        (RuntimeError("HTTPStatusError: 401 unauthorized"), "denied access"),
+        (RuntimeError("rate limit exceeded"), "rate-limiting"),
+        (RuntimeError("validation_error: bad property"), "rejected the request"),
+        (RuntimeError("kafkaesque random error"), "something went wrong"),
+    ]
+    for err, expected_substr in cases:
+        assert expected_substr in _sanitize_notion_error(err), err
+
+
+def test_execute_plan_surfaces_persistent_delete_failure(_no_retry_sleep):
+    from agentic_tasks.agent.preview import execute_plan
+    from agentic_tasks.notion_io.tasks import Task
+
+    stubborn = Task(
+        page_id="p1",
+        name="Stubborn task",
+        status="To Do",
+        priority=None,
+        due=None,
+        archived=False,
+    )
+
+    def fake_delete(page_id):
+        # Always returns archived=False — verification will never pass.
+        return stubborn
+
+    with patch(
+        "agentic_tasks.agent.tools.delete_task", side_effect=fake_delete
+    ) as mock_delete, patch(
+        "agentic_tasks.agent.preview.get_task", return_value=stubborn
+    ):
+        out = execute_plan(
+            [{"tool": "delete_tasks", "arguments": {"page_ids": ["p1"]}}]
+        )
+
+    assert mock_delete.call_count == 3
+    assert "Failed." in out
+    assert "Couldn't delete" in out
+    assert "Stubborn task" in out
+    assert "didn't land in Notion" in out
 
 
 def test_execute_plan_retries_create_on_exception_then_succeeds(_no_retry_sleep):

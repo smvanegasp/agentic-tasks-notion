@@ -242,6 +242,25 @@ def test_complete_tasks_works_for_single_id(mock_complete):
     mock_complete.assert_called_once_with("page-1")
 
 
+# ---- delete_tasks (batch) -------------------------------------------------
+
+
+@patch("agentic_tasks.agent.tools.delete_task")
+def test_delete_tasks_dispatches_each_id(mock_delete):
+    mock_delete.side_effect = [_task("X", "page-1"), _task("Y", "page-2")]
+
+    call_tool("delete_tasks", {"page_ids": ["page-1", "page-2"]})
+
+    assert mock_delete.call_count == 2
+    assert mock_delete.call_args_list[0].args == ("page-1",)
+    assert mock_delete.call_args_list[1].args == ("page-2",)
+
+
+def test_delete_tasks_rejects_empty_list():
+    result = call_tool("delete_tasks", {"page_ids": []})
+    assert "error" in result.lower() or "Invalid" in result
+
+
 # ---- update_tasks (batch) -------------------------------------------------
 
 

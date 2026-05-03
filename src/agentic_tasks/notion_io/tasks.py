@@ -28,6 +28,7 @@ class Task:
     description: str = ""
     my_day: bool = False
     url: str = ""
+    archived: bool = False
 
 
 def _plain_text(rich_text: list[dict]) -> str:
@@ -77,6 +78,7 @@ def _parse_task(page: dict) -> Task:
         description=description,
         my_day=my_day,
         url=page.get("url", ""),
+        archived=bool(page.get("archived") or page.get("in_trash")),
     )
 
 
@@ -278,3 +280,16 @@ def update_task(
 
 def complete_task(page_id: str) -> Task:
     return update_task(page_id, status=Status.DONE)
+
+
+def delete_task(page_id: str) -> Task:
+    """Move a task page to Notion's Trash via ``in_trash=True``.
+
+    ``in_trash`` is the documented field name in Notion API version
+    2025-09-03 (the version pinned by ``notion-client`` 3.x). The page is
+    recoverable from Notion's Trash UI; its URL keeps working (it just
+    lands on the "moved to Trash" view), so callers can still link to it
+    in the confirmation summary.
+    """
+    response: Any = get_client().pages.update(page_id=page_id, in_trash=True)
+    return _parse_task(response)
