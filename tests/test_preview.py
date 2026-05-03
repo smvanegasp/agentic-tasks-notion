@@ -557,6 +557,193 @@ def test_format_preview_shift_due_dates_handles_no_matches():
     assert "no matching open tasks" in out
 
 
+@pytest.fixture
+def _no_retry_sleep(monkeypatch):
+    """Make _attempt_with_retry's backoff zero so failure-path tests stay fast."""
+    monkeypatch.setattr(
+        "agentic_tasks.agent.preview._RETRY_BACKOFF_SECONDS", 0
+    )
+
+
+# ---- verification + retry ------------------------------------------------
+
+
+def test_execute_plan_retries_when_update_did_not_land(_no_retry_sleep):
+    """Notion returned the page but the field we asked to change didn't
+    actually change — the helper retries until a later attempt verifies
+    cleanly. The user sees plain "Done." not a soft failure."""
+    from datetime import date as _date
+
+    from agentic_tasks.agent.preview import execute_plan
+    from agentic_tasks.notion_io.tasks import Task
+
+    calls = {"n": 0}
+
+    def fake_update(page_id, **_kw):
+        calls["n"] += 1
+        # First two attempts return an unchanged due; third one lands.
+        due = _date(2026, 5, 9) if calls["n"] >= 3 else _date(2026, 4, 1)
+        return Task(
+            page_id=page_id,
+            name="Vietnam docs",
+            status="To Do",
+            priority=None,
+            due=due,
+            url="https://www.notion.so/Vietnam-docs",
+        )
+
+    plan = [
+        {
+            "tool": "update_tasks",
+            "arguments": {
+                "updates": [{"page_id": "p1", "due": "2026-05-09"}]
+            },
+        }
+    ]
+    with patch("agentic_tasks.agent.tools.update_task", side_effect=fake_update):
+        out = execute_plan(plan)
+
+    assert calls["n"] == 3
+    assert out.startswith("Done.")
+    assert "Vietnam docs" in out
+
+
+def test_execute_plan_surfaces_persistent_verification_mismatch(_no_retry_sleep):
+    """If verification fails on every attempt, the user sees an honest
+    'did not land cleanly' error, NOT a fake 'Done.'"""
+    from datetime import date as _date
+
+    from agentic_tasks.agent.preview import execute_plan
+    from agentic_tasks.notion_io.tasks import Task
+
+    def fake_update(page_id, **_kw):
+        # Always returns the page WITHOUT the requested due change.
+        return Task(
+            page_id=page_id,
+            name="Stuck task",
+            status="To Do",
+            priority=None,
+            due=_date(2026, 4, 1),
+        )
+
+    plan = [
+        {
+            "tool": "update_tasks",
+            "arguments": {
+                "updates": [{"page_id": "p1", "due": "2026-05-09"}]
+            },
+        }
+    ]
+    with patch(
+        "agentic_tasks.agent.tools.update_task", side_effect=fake_update
+    ) as mock_update:
+        out = execute_plan(plan)
+
+    assert mock_update.call_count == 3  # MAX_MUTATION_ATTEMPTS
+    assert "Failed." in out
+    assert "did not land cleanly" in out
+    assert "Please check Notion" in out
+
+
+def test_execute_plan_retries_complete_until_status_is_done(_no_retry_sleep):
+    """Notion returned the page with the wrong status — retry until status
+    actually becomes Done."""
+    from agentic_tasks.agent.preview import execute_plan
+    from agentic_tasks.notion_io.tasks import Task
+
+    calls = {"n": 0}
+
+    def fake_complete(page_id):
+        calls["n"] += 1
+        status = "Done" if calls["n"] >= 2 else "To Do"
+        return Task(
+            page_id=page_id,
+            name="Pay rent",
+            status=status,
+            priority=None,
+            due=None,
+            url="https://www.notion.so/Pay-rent",
+        )
+
+    with patch(
+        "agentic_tasks.agent.tools.complete_task", side_effect=fake_complete
+    ):
+        out = execute_plan(
+            [{"tool": "complete_tasks", "arguments": {"page_ids": ["p1"]}}]
+        )
+
+    assert calls["n"] == 2
+    assert out.startswith("Done.")
+    assert "Pay rent" in out
+
+
+def test_execute_plan_retries_create_on_exception_then_succeeds(_no_retry_sleep):
+    """A transient Notion exception on the first try is retried; the second
+    attempt succeeds and the user sees a clean 'Done.'"""
+    from agentic_tasks.agent.preview import execute_plan
+    from agentic_tasks.notion_io.tasks import Task
+
+    calls = {"n": 0}
+    created = Task(
+        page_id="p-x",
+        name="Buy markers",
+        status="To Do",
+        priority=None,
+        due=None,
+        url="https://www.notion.so/p-x",
+    )
+
+    def fake_create(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("transient flake")
+        return created
+
+    with patch("agentic_tasks.agent.tools.create_task", side_effect=fake_create):
+        out = execute_plan(
+            [{"tool": "create_tasks", "arguments": {"tasks": [{"name": "Buy markers"}]}}]
+        )
+
+    assert calls["n"] == 2
+    assert out.startswith("Done.")
+    assert "Buy markers" in out
+
+
+def test_execute_plan_retries_due_clear_until_actually_cleared(_no_retry_sleep):
+    """Clearing a due date is a common 'silent no-op' shape — make sure the
+    verifier catches it and retries."""
+    from datetime import date as _date
+
+    from agentic_tasks.agent.preview import execute_plan
+    from agentic_tasks.notion_io.tasks import Task
+
+    calls = {"n": 0}
+
+    def fake_update(page_id, **_kw):
+        calls["n"] += 1
+        # First two return the old date; third actually clears.
+        due = None if calls["n"] >= 3 else _date(2026, 5, 1)
+        return Task(
+            page_id=page_id,
+            name="Ambiguous task",
+            status="To Do",
+            priority=None,
+            due=due,
+        )
+
+    plan = [
+        {
+            "tool": "update_tasks",
+            "arguments": {"updates": [{"page_id": "p1", "due": ""}]},
+        }
+    ]
+    with patch("agentic_tasks.agent.tools.update_task", side_effect=fake_update):
+        out = execute_plan(plan)
+
+    assert calls["n"] == 3
+    assert out.startswith("Done.")
+
+
 def test_execute_plan_shift_due_dates_flattens_results():
     """Each shifted task should produce its own success entry in the summary."""
     from datetime import date as _date

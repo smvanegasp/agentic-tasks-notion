@@ -381,6 +381,61 @@ def test_looks_degenerate_allows_normal_ellipsis_use():
     assert not _looks_degenerate("Wait — and then it happened…")
     assert not _looks_degenerate(None)
     assert not _looks_degenerate("")
+    # Single ellipsis in a real-shaped reply must not trip detection.
+    assert not _looks_degenerate("Tomorrow:\n• Buy markers... eventually")
+    # Normal "I need to know which" — not a self-coaching pattern.
+    assert not _looks_degenerate(
+        "I need to know which task you mean — APD or APR?"
+    )
+
+
+def test_looks_degenerate_detects_scattered_ellipses_with_question_marks():
+    """Real production failure: ellipsis tokens spread across the reply,
+    interleaved with `?` and other punctuation. Old regex required them to
+    be consecutive — these pass it but the new count-based check catches
+    them."""
+    from agentic_tasks.agent.loop import _looks_degenerate
+
+    bad = (
+        "Tomorrow:\n• HEA: Get           ...  … ? ? ... ? ? … ..."
+    )
+    assert _looks_degenerate(bad)
+
+    # Three scattered ellipses across multiple bullets.
+    assert _looks_degenerate(
+        "Today:\n• A...\n• B…\n• C..."
+    )
+
+
+def test_looks_degenerate_detects_thinking_channel_leakage():
+    """gpt-oss reasoning channel sometimes leaks into the user-facing
+    output. The phrases below have no place in a normal Telegram reply."""
+    from agentic_tasks.agent.loop import _looks_degenerate
+
+    assert _looks_degenerate(
+        "The previous answer appears garbled. Need to correctly format..."
+    )
+    assert _looks_degenerate(
+        "Provide bullet list with proper names, no extra formatting."
+    )
+    assert _looks_degenerate('Use "Tomorrow:" heading.')
+    assert _looks_degenerate("Must not include ellipsis.")
+    assert _looks_degenerate("The previous reply got truncated.")
+
+
+def test_looks_degenerate_does_not_match_normal_phrasing():
+    """Normal user-facing replies that happen to contain "need to" or
+    similar must NOT trip the leak detector."""
+    from agentic_tasks.agent.loop import _looks_degenerate
+
+    assert not _looks_degenerate(
+        "You'll need to confirm whether to mark it Done or shift it."
+    )
+    assert not _looks_degenerate(
+        "Please provide the project name so I can match it."
+    )
+    # The bot writes day subheaders but should never SAY "use ... heading".
+    assert not _looks_degenerate("<b>Tomorrow, May 3:</b>\n• Task A")
 
 
 @patch("agentic_tasks.agent.loop.call_tool")
@@ -635,3 +690,346 @@ def test_loop_handles_invalid_tool_arguments_json(mock_openai_cls, mock_call_too
 
     assert reply == "ok"
     mock_call_tool.assert_called_once_with("list_projects", {})
+
+
+# ---- ghost-preview defense -------------------------------------------------
+
+
+def test_looks_like_ghost_preview_matches_system_footer():
+    from agentic_tasks.agent.loop import _looks_like_ghost_preview
+
+    assert _looks_like_ghost_preview(
+        'About to:\n• Update "X" — due tomorrow\n\nReply y to proceed or n to cancel.'
+    )
+    # Telegram-rendered HTML form (matches when <b> tags are present too).
+    assert _looks_like_ghost_preview(
+        'About to:\n• Update "X"\n\nReply <b>y</b> to proceed or <b>n</b> to cancel.'
+    )
+
+
+def test_looks_like_ghost_preview_ignores_normal_replies():
+    from agentic_tasks.agent.loop import _looks_like_ghost_preview
+
+    assert not _looks_like_ghost_preview("Done. Updated X.")
+    assert not _looks_like_ghost_preview("I'll proceed once you reply.")
+    assert not _looks_like_ghost_preview(None)
+    assert not _looks_like_ghost_preview("")
+
+
+@patch("agentic_tasks.agent.loop.call_tool")
+@patch("agentic_tasks.agent.loop.OpenAI")
+def test_loop_retries_when_model_emits_ghost_preview(mock_openai_cls, mock_call_tool):
+    """The model wrote a fake preview in chat instead of emitting a write
+    tool. The loop must inject feedback and retry — and on the retry, the
+    model emits the real tool call, the system shows the real preview."""
+    from agentic_tasks.agent.loop import run_agent
+
+    fake_preview = (
+        'About to:\n• Update "Vietnam docs" — due tomorrow\n\n'
+        "Reply y to proceed or n to cancel."
+    )
+    client = MagicMock()
+    client.chat.completions.create.side_effect = [
+        _response(content=fake_preview),
+        _response(
+            tool_calls=[
+                _tool_call(
+                    "update_tasks",
+                    '{"updates": [{"page_id": "p1", "due": "2026-05-03"}]}',
+                    tc_id="tc-r",
+                ),
+            ]
+        ),
+    ]
+    mock_openai_cls.return_value = client
+
+    from unittest.mock import patch as _patch
+
+    from agentic_tasks.notion_io.tasks import Task
+
+    fake_task = Task(
+        page_id="p1", name="Vietnam docs", status="To Do", priority=None, due=None
+    )
+    with _patch("agentic_tasks.agent.preview.get_task", return_value=fake_task):
+        reply, agent_messages, pending = run_agent("reschedule Vietnam to tomorrow")
+
+    # Two LLM calls: original (ghost) + retry (real tool).
+    assert client.chat.completions.create.call_count == 2
+
+    # Final user-facing reply is the system-generated preview, not the ghost.
+    assert "About to" in reply
+    assert "Vietnam docs" in reply
+    assert pending is not None and pending[0]["tool"] == "update_tasks"
+
+    # Persisted history must NOT contain the ghost — only the clean
+    # system-generated preview the user actually sees.
+    assert len(agent_messages) == 1
+    assert agent_messages[0]["role"] == "assistant"
+    assert agent_messages[0]["content"] == reply
+    assert "Reply y to proceed or n to cancel" not in agent_messages[0]["content"] \
+        or fake_preview not in agent_messages[0]["content"]
+
+    # The retry round must have included a system message telling the model
+    # what it did wrong.
+    second_call_messages = client.chat.completions.create.call_args_list[1].kwargs[
+        "messages"
+    ]
+    feedback_msgs = [
+        m for m in second_call_messages
+        if m["role"] == "system" and "imitated" in m["content"]
+    ]
+    assert len(feedback_msgs) == 1
+
+
+def _format_check_response(verdict: str):
+    """Build a chat-completions response for the format-check model."""
+    msg = MagicMock()
+    msg.content = verdict
+    msg.tool_calls = []
+    response = MagicMock()
+    response.choices = [MagicMock(message=msg)]
+    return response
+
+
+def test_check_format_returns_none_on_ok_verdict():
+    from agentic_tasks.agent.loop import _check_format
+
+    client = MagicMock()
+    client.chat.completions.create.return_value = _format_check_response("OK")
+
+    feedback = _check_format(client, "openai/gpt-oss-20b", "what's today?", "Today:\n• A")
+
+    assert feedback is None
+    client.chat.completions.create.assert_called_once()
+    kwargs = client.chat.completions.create.call_args.kwargs
+    assert kwargs["model"] == "openai/gpt-oss-20b"
+
+
+def test_check_format_returns_reason_on_bad_verdict():
+    from agentic_tasks.agent.loop import _check_format
+
+    client = MagicMock()
+    client.chat.completions.create.return_value = _format_check_response(
+        "BAD: contains repeated ellipsis tokens"
+    )
+
+    feedback = _check_format(
+        client, "openai/gpt-oss-20b", "what's today?", "Today:\n• A ... ..."
+    )
+
+    assert feedback == "contains repeated ellipsis tokens"
+
+
+def test_check_format_fails_open_on_exception():
+    """Validator API errors must NOT block legitimate replies — fail open."""
+    from agentic_tasks.agent.loop import _check_format
+
+    client = MagicMock()
+    client.chat.completions.create.side_effect = RuntimeError("validator down")
+
+    feedback = _check_format(client, "openai/gpt-oss-20b", "q", "r")
+
+    assert feedback is None
+
+
+def test_check_format_fails_open_on_unparseable_verdict():
+    from agentic_tasks.agent.loop import _check_format
+
+    client = MagicMock()
+    client.chat.completions.create.return_value = _format_check_response(
+        "I think this looks fine to me actually"
+    )
+
+    feedback = _check_format(client, "openai/gpt-oss-20b", "q", "r")
+
+    assert feedback is None
+
+
+@patch("agentic_tasks.agent.loop.call_tool")
+@patch("agentic_tasks.agent.loop.OpenAI")
+def test_loop_runs_format_check_when_enabled(
+    mock_openai_cls, mock_call_tool, monkeypatch
+):
+    """When LLM_FORMAT_CHECK_MODEL is set, the loop calls the format checker
+    after producing a final reply."""
+    monkeypatch.setenv("LLM_FORMAT_CHECK_MODEL", "openai/gpt-oss-20b")
+    from agentic_tasks.config import get_settings
+
+    get_settings.cache_clear()
+
+    from agentic_tasks.agent.loop import run_agent
+
+    client = MagicMock()
+    # First call: main model produces reply. Second call: format check returns OK.
+    client.chat.completions.create.side_effect = [
+        _response(content="Today:\n• Buy markers"),
+        _format_check_response("OK"),
+    ]
+    mock_openai_cls.return_value = client
+
+    reply, _, pending = run_agent("what's today?")
+
+    assert reply == "Today:\n• Buy markers"
+    assert pending is None
+    # Two calls: main agent + format check. Format check used the small model.
+    assert client.chat.completions.create.call_count == 2
+    second_call_kwargs = client.chat.completions.create.call_args_list[1].kwargs
+    assert second_call_kwargs["model"] == "openai/gpt-oss-20b"
+
+
+@patch("agentic_tasks.agent.loop.call_tool")
+@patch("agentic_tasks.agent.loop.OpenAI")
+def test_loop_skips_format_check_when_disabled(mock_openai_cls, mock_call_tool):
+    """Empty LLM_FORMAT_CHECK_MODEL disables the check — only one LLM call."""
+    # conftest already sets LLM_FORMAT_CHECK_MODEL="" by default.
+    from agentic_tasks.agent.loop import run_agent
+
+    client = MagicMock()
+    client.chat.completions.create.return_value = _response(content="Hello.")
+    mock_openai_cls.return_value = client
+
+    run_agent("hi")
+
+    assert client.chat.completions.create.call_count == 1
+
+
+@patch("agentic_tasks.agent.loop.call_tool")
+@patch("agentic_tasks.agent.loop.OpenAI")
+def test_loop_retries_when_format_check_says_bad(
+    mock_openai_cls, mock_call_tool, monkeypatch
+):
+    """BAD verdict from the format checker triggers a one-shot retry of the
+    main model with feedback. The corrected reply is returned to the user."""
+    monkeypatch.setenv("LLM_FORMAT_CHECK_MODEL", "openai/gpt-oss-20b")
+    from agentic_tasks.config import get_settings
+
+    get_settings.cache_clear()
+
+    from agentic_tasks.agent.loop import run_agent
+
+    # Use replies that don't trip the cheap degenerate regex, so the BAD
+    # verdict comes from the LLM checker (not the inline regex retry).
+    bad = "Today:\n• Buy markers (something off here)"
+    good = "Today:\n• Buy markers"
+    client = MagicMock()
+    client.chat.completions.create.side_effect = [
+        _response(content=bad),
+        _format_check_response("BAD: contains 3 ellipsis tokens"),
+        _response(content=good),
+        # No second format check — the retry-done flag prevents a re-validate
+        # of the corrected reply, which is fine: at worst the user sees one
+        # extra slightly-imperfect reply rather than an infinite loop.
+    ]
+    mock_openai_cls.return_value = client
+
+    reply, agent_messages, _ = run_agent("what's today?")
+
+    assert reply == good
+    # 3 LLM calls: main, format check (BAD), main retry.
+    assert client.chat.completions.create.call_count == 3
+    # Persisted history contains exactly the corrected reply, not the bad one.
+    assert len(agent_messages) == 1
+    assert agent_messages[0] == {"role": "assistant", "content": good}
+
+    # Retry round must have included a system message with the validator's
+    # rejection reason.
+    third_call_messages = client.chat.completions.create.call_args_list[2].kwargs[
+        "messages"
+    ]
+    feedback_msgs = [
+        m for m in third_call_messages
+        if m["role"] == "system" and "format validator rejected" in m["content"]
+    ]
+    assert len(feedback_msgs) == 1
+    assert "ellipsis tokens" in feedback_msgs[0]["content"]
+
+
+@patch("agentic_tasks.agent.loop.call_tool")
+@patch("agentic_tasks.agent.loop.OpenAI")
+def test_loop_accepts_second_bad_format_to_avoid_loop(
+    mock_openai_cls, mock_call_tool, monkeypatch
+):
+    """If the retry is ALSO judged BAD, the loop accepts it rather than
+    retrying forever."""
+    monkeypatch.setenv("LLM_FORMAT_CHECK_MODEL", "openai/gpt-oss-20b")
+    from agentic_tasks.config import get_settings
+
+    get_settings.cache_clear()
+
+    from agentic_tasks.agent.loop import run_agent
+
+    # Plain replies that don't trip the cheap regex — the BAD verdicts come
+    # from the format checker mock, not from the inline degenerate path.
+    bad1 = "first attempt looks weird"
+    bad2 = "second attempt also weird"
+    client = MagicMock()
+    client.chat.completions.create.side_effect = [
+        _response(content=bad1),
+        _format_check_response("BAD: weird"),
+        _response(content=bad2),
+        # No more format-check calls — flag is set after first BAD.
+    ]
+    mock_openai_cls.return_value = client
+
+    reply, _, _ = run_agent("hi")
+
+    assert reply == bad2
+    # Three calls: main, check, main retry. Second check is skipped.
+    assert client.chat.completions.create.call_count == 3
+
+
+@patch("agentic_tasks.agent.loop.call_tool")
+@patch("agentic_tasks.agent.loop.OpenAI")
+def test_loop_does_not_run_format_check_on_tool_call_rounds(
+    mock_openai_cls, mock_call_tool, monkeypatch
+):
+    """Format check only fires on FINAL replies — never on rounds where the
+    model emits a tool call (those go straight to dispatch)."""
+    monkeypatch.setenv("LLM_FORMAT_CHECK_MODEL", "openai/gpt-oss-20b")
+    from agentic_tasks.config import get_settings
+
+    get_settings.cache_clear()
+
+    from agentic_tasks.agent.loop import run_agent
+
+    mock_call_tool.return_value = '{"tasks": []}'
+    client = MagicMock()
+    client.chat.completions.create.side_effect = [
+        _response(tool_calls=[_tool_call("query_tasks", '{"due_on": "2026-05-03"}')]),
+        _response(content="Nothing for tomorrow."),
+        _format_check_response("OK"),
+    ]
+    mock_openai_cls.return_value = client
+
+    reply, _, _ = run_agent("anything tomorrow?")
+
+    assert reply == "Nothing for tomorrow."
+    # 3 LLM calls: tool round, final reply, format check on the final reply.
+    # NOT 4 (no format check on the tool-call round).
+    assert client.chat.completions.create.call_count == 3
+
+
+@patch("agentic_tasks.agent.loop.call_tool")
+@patch("agentic_tasks.agent.loop.OpenAI")
+def test_loop_does_not_loop_forever_on_repeated_ghost_preview(
+    mock_openai_cls, mock_call_tool
+):
+    """If the model writes a ghost preview a second time, return it as-is
+    rather than looping forever."""
+    from agentic_tasks.agent.loop import run_agent
+
+    fake = (
+        'About to:\n• Create "X"\n\nReply y to proceed or n to cancel.'
+    )
+    client = MagicMock()
+    client.chat.completions.create.side_effect = [
+        _response(content=fake),
+        _response(content=fake),
+    ]
+    mock_openai_cls.return_value = client
+
+    reply, _, pending = run_agent("create X")
+
+    assert reply == fake
+    assert pending is None
+    assert client.chat.completions.create.call_count == 2

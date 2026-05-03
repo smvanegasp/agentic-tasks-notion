@@ -37,6 +37,12 @@ Parameters:
   LlmModel:
     Type: String
     Default: openai/gpt-oss-120b
+  LlmFormatCheckModel:
+    Type: String
+    Default: openai/gpt-oss-20b
+    Description: >
+      Small model used to validate the main model's reply format before
+      sending to Telegram. Set to empty string to disable the check.
   LlmBaseUrl:
     Type: String
     Default: https://api.groq.com/openai/v1
@@ -61,6 +67,7 @@ Globals:
         TIMEZONE: !Ref Timezone
         DIGEST_TIME: !Sub "${DigestHour}:${DigestMinute}"
         LLM_MODEL: !Ref LlmModel
+        LLM_FORMAT_CHECK_MODEL: !Ref LlmFormatCheckModel
         LLM_BASE_URL: !Ref LlmBaseUrl
         TRANSCRIPTION_MODEL: !Ref TranscriptionModel
         CONVERSATION_HISTORY_LIMIT: !Ref ConversationHistoryLimit

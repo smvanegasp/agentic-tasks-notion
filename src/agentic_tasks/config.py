@@ -33,6 +33,10 @@ class Settings:
 
     llm_base_url: str  # empty string means "use the OpenAI SDK default"
     llm_model: str
+    # Model used for the post-reply format validator. A small fast model is
+    # plenty here — it only judges whether the main model's reply looks
+    # well-formed. Empty string disables the check.
+    llm_format_check_model: str
     transcription_model: str
     timezone: ZoneInfo
     digest_time: str
@@ -53,6 +57,9 @@ class Settings:
                 "LLM_BASE_URL", "https://api.groq.com/openai/v1"
             ),
             llm_model=os.environ.get("LLM_MODEL", "openai/gpt-oss-120b"),
+            llm_format_check_model=os.environ.get(
+                "LLM_FORMAT_CHECK_MODEL", "openai/gpt-oss-20b"
+            ),
             transcription_model=os.environ.get(
                 "TRANSCRIPTION_MODEL", "whisper-large-v3"
             ),

@@ -16,6 +16,9 @@ def _stub_env(monkeypatch):
         "NOTION_TASKS_DB_ID": "tasks-db-id",
         "NOTION_PROJECTS_DB_ID": "projects-db-id",
         "ALLOWED_TELEGRAM_USER_ID": "12345",
+        # The LLM-based format check is opt-in for tests — exercising tests
+        # that need it set their own value with monkeypatch.
+        "LLM_FORMAT_CHECK_MODEL": "",
     }.items():
         monkeypatch.setenv(k, v)
 

@@ -16,6 +16,7 @@ import html
 import json
 import logging
 import re
+import time
 from datetime import date, datetime, timedelta
 from typing import Any
 
@@ -28,6 +29,7 @@ from agentic_tasks.agent.tools import (
     ShiftDueDatesArgs,
     TaskUpdate,
     UpdateTasksArgs,
+    _parse_iso_date,
     execute_complete_tasks,
     execute_create_tasks,
     execute_shift_due_dates,
@@ -42,6 +44,13 @@ log = logging.getLogger(__name__)
 WRITE_TOOL_NAMES = frozenset(
     {"create_tasks", "update_tasks", "complete_tasks", "shift_due_dates"}
 )
+
+# Each individual mutation gets re-attempted on failure (exception OR
+# verification mismatch). The user reported "says done but isn't done"
+# behavior; an immediate retry with verification catches transient Notion
+# flakes without needing another LLM round-trip.
+MAX_MUTATION_ATTEMPTS = 3
+_RETRY_BACKOFF_SECONDS = 0.3
 
 _CONFIRM_RE = re.compile(
     r"^\s*(y|yes|yeah|yep|sí|si|ok|okay|sure|👍)\s*[!.]?\s*$",
@@ -308,12 +317,15 @@ def _run_create_batch(
         errors.append(f"invalid create_tasks args: {html.escape(str(e))}")
         return
     for spec in args.tasks:
-        try:
-            task = execute_create_tasks(CreateTasksArgs(tasks=[spec]))[0]
+        task, error = _attempt_with_retry(
+            do=lambda spec=spec: execute_create_tasks(CreateTasksArgs(tasks=[spec]))[0],
+            verify=lambda task, spec=spec: _verify_create(spec, task),
+            label=f'create "{spec.name}"',
+        )
+        if task is not None:
             successes.append(("Created", task))
-        except Exception as e:  # noqa: BLE001
-            log.exception("create_tasks: %r failed", spec.name)
-            errors.append(f'create "{html.escape(spec.name)}" failed: {html.escape(str(e))}')
+        else:
+            errors.append(error)
 
 
 def _run_update_batch(
@@ -327,12 +339,15 @@ def _run_update_batch(
         errors.append(f"invalid update_tasks args: {html.escape(str(e))}")
         return
     for spec in args.updates:
-        try:
-            task = execute_update_tasks(UpdateTasksArgs(updates=[spec]))[0]
+        task, error = _attempt_with_retry(
+            do=lambda spec=spec: execute_update_tasks(UpdateTasksArgs(updates=[spec]))[0],
+            verify=lambda task, spec=spec: _verify_update(spec, task),
+            label=f"update {spec.page_id[:8]}",
+        )
+        if task is not None:
             successes.append(("Updated", task))
-        except Exception as e:  # noqa: BLE001
-            log.exception("update_tasks: %s failed", spec.page_id)
-            errors.append(f"update {html.escape(spec.page_id[:8])} failed: {html.escape(str(e))}")
+        else:
+            errors.append(error)
 
 
 def _run_complete_batch(
@@ -346,12 +361,143 @@ def _run_complete_batch(
         errors.append(f"invalid complete_tasks args: {html.escape(str(e))}")
         return
     for page_id in args.page_ids:
-        try:
-            task = execute_complete_tasks(CompleteTasksArgs(page_ids=[page_id]))[0]
+        task, error = _attempt_with_retry(
+            do=lambda page_id=page_id: execute_complete_tasks(
+                CompleteTasksArgs(page_ids=[page_id])
+            )[0],
+            verify=_verify_complete,
+            label=f"complete {page_id[:8]}",
+        )
+        if task is not None:
             successes.append(("Completed", task))
+        else:
+            errors.append(error)
+
+
+# ---- Mutation retry with verification --------------------------------------
+
+
+def _attempt_with_retry(
+    *,
+    do: Any,
+    verify: Any,
+    label: str,
+) -> tuple[Task | None, str]:
+    """Run a single mutation up to MAX_MUTATION_ATTEMPTS times, verifying the
+    returned page after each successful call.
+
+    A retry is triggered by either an exception OR a verification mismatch
+    (the page came back but the field we asked to change didn't actually
+    change). On persistent failure, returns ``(None, html_error)`` so the
+    caller can append it to the error list and surface it honestly to the
+    user instead of claiming "Done."
+    """
+    last_error = f"{label} failed"
+    for attempt in range(1, MAX_MUTATION_ATTEMPTS + 1):
+        try:
+            task = do()
         except Exception as e:  # noqa: BLE001
-            log.exception("complete_tasks: %s failed", page_id)
-            errors.append(f"complete {html.escape(page_id[:8])} failed: {html.escape(str(e))}")
+            log.warning(
+                "%s attempt %d/%d raised: %s",
+                label, attempt, MAX_MUTATION_ATTEMPTS, e,
+            )
+            last_error = (
+                f"{html.escape(label)} failed: {html.escape(str(e))}"
+            )
+            if attempt < MAX_MUTATION_ATTEMPTS:
+                time.sleep(_RETRY_BACKOFF_SECONDS * attempt)
+            continue
+
+        mismatch = verify(task)
+        if mismatch is None:
+            if attempt > 1:
+                log.info("%s succeeded on attempt %d", label, attempt)
+            return task, ""
+
+        log.warning(
+            "%s attempt %d/%d verification failed: %s",
+            label, attempt, MAX_MUTATION_ATTEMPTS, mismatch,
+        )
+        last_error = (
+            f"{html.escape(label)} did not land cleanly"
+            f" ({html.escape(mismatch)}). Please check Notion."
+        )
+        if attempt < MAX_MUTATION_ATTEMPTS:
+            time.sleep(_RETRY_BACKOFF_SECONDS * attempt)
+
+    return None, last_error
+
+
+def _verify_create(spec: NewTask, returned: Task) -> str | None:
+    """Return a short reason if the created page doesn't reflect the spec.
+
+    Verifies the fields most likely to silently no-op: name, due, priority,
+    my_day. Description / labels / project are skipped (looser matching, less
+    common failure mode).
+    """
+    if returned.name != spec.name:
+        return f"name → {returned.name!r}"
+    if spec.priority and returned.priority != spec.priority:
+        return f"priority → {returned.priority!r}"
+    if spec.my_day and not returned.my_day:
+        return "my_day → off"
+    if spec.due:
+        try:
+            expected = _parse_iso_date(spec.due)
+        except ValueError:
+            return None
+        if not _due_matches(expected, returned.due):
+            return f"due → {returned.due}"
+    return None
+
+
+def _verify_update(spec: TaskUpdate, returned: Task) -> str | None:
+    """Return a short reason if the updated page doesn't reflect the spec."""
+    if spec.name is not None and returned.name != spec.name:
+        return f"name → {returned.name!r}"
+    if spec.priority is not None and returned.priority != spec.priority:
+        return f"priority → {returned.priority!r}"
+    if spec.status is not None and returned.status != spec.status:
+        return f"status → {returned.status!r}"
+    if spec.my_day is not None and returned.my_day != spec.my_day:
+        return f"my_day → {returned.my_day}"
+    if spec.due is not None:
+        if spec.due == "":
+            if returned.due is not None:
+                return f"due not cleared (still {returned.due})"
+        else:
+            try:
+                expected = _parse_iso_date(spec.due)
+            except ValueError:
+                return None
+            if not _due_matches(expected, returned.due):
+                return f"due → {returned.due}"
+    return None
+
+
+def _verify_complete(returned: Task) -> str | None:
+    if returned.status != "Done":
+        return f"status → {returned.status!r}"
+    return None
+
+
+def _due_matches(expected: date | datetime, actual: date | datetime | None) -> bool:
+    """Compare a parsed expected date/datetime against a returned ``Task.due``.
+
+    Date specs match against either the date part of a returned datetime or a
+    returned date. Datetime specs require both to be datetimes and equal at
+    second resolution.
+    """
+    if actual is None:
+        return False
+    if isinstance(expected, datetime):
+        if not isinstance(actual, datetime):
+            return False
+        return actual.replace(microsecond=0) == expected.replace(microsecond=0)
+    # expected is plain date
+    if isinstance(actual, datetime):
+        return actual.date() == expected
+    return actual == expected
 
 
 def _run_shift_batch(

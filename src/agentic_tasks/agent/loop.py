@@ -45,14 +45,146 @@ MAX_ITERATIONS = 25
 # above any single Telegram message we'd plausibly send.
 MAX_COMPLETION_TOKENS = 4096
 
-# gpt-oss-120b on Groq occasionally degenerates into ellipsis repetition or
-# echoed gibberish on the final natural-language reply. We detect that pattern
-# (5+ consecutive ellipsis tokens) and retry the same call once.
+# gpt-oss-120b on Groq occasionally produces broken final replies. We detect
+# them and retry the same call once. Three signal classes:
+#
+# 1. Consecutive ellipsis runs (the original failure mode).
+# 2. Scattered ellipses (3+ total in one reply, possibly interleaved with
+#    other punctuation like "?"). One real reply has at most one ellipsis;
+#    three is anomalous.
+# 3. Self-coaching / analysis-channel leakage. gpt-oss models have a hidden
+#    reasoning channel that Groq normally strips; when stripping fails, the
+#    final reply contains phrases the assistant has no legitimate reason to
+#    write to a user ("the previous answer appears garbled", "provide bullet
+#    list", "use 'Tomorrow:' heading", "must not include ellipsis"). These
+#    are how the model talks to itself, not to the user.
 _DEGENERATE_REPLY_RE = re.compile(r"(?:\.{3}|…)(?:\s*(?:\.{3}|…)){4,}")
+_ELLIPSIS_TOKEN_RE = re.compile(r"\.{3}|…")
+_THINKING_LEAK_RE = re.compile(
+    r"(?:"
+    r"the previous (?:answer|reply|response)"
+    r"|previous (?:answer|reply|response) (?:appears|was|got|seems)"
+    r"|appears\s+(?:garbled|truncated|incomplete|broken)"
+    r"|got\s+(?:truncated|cut\s+off|garbled)"
+    r"|need\s+to\s+(?:correctly|just|simply|properly)\s+(?:format|provide|show|reply|output|use)"
+    r"|provide\s+(?:a\s+|the\s+)?bullet\s+list"
+    r"|use\s+\"[A-Za-z][A-Za-z\s]{0,20}:?\"\s+(?:as\s+)?(?:the\s+)?heading"
+    r"|must\s+not\s+include\s+(?:ellipsis|dots|extra|backslash|escape)"
+    r")",
+    re.IGNORECASE,
+)
 
 
 def _looks_degenerate(text: str | None) -> bool:
-    return bool(text and _DEGENERATE_REPLY_RE.search(text))
+    if not text:
+        return False
+    if _DEGENERATE_REPLY_RE.search(text):
+        return True
+    if _THINKING_LEAK_RE.search(text):
+        return True
+    if len(_ELLIPSIS_TOKEN_RE.findall(text)) >= 3:
+        return True
+    return False
+
+
+# The model occasionally hallucinates the system's confirmation preview in
+# plain chat instead of emitting the write tool call — the user then sees
+# the same plan twice (once fake, once real after they reply Y). This
+# pattern catches the unique footer phrase the system uses; the model has
+# no legitimate reason to write it.
+_GHOST_PREVIEW_RE = re.compile(
+    r"reply\s+(?:<b>)?\s*y\s*(?:</b>)?\s+to\s+proceed",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_ghost_preview(text: str | None) -> bool:
+    return bool(text and _GHOST_PREVIEW_RE.search(text))
+
+
+# Last-line-of-defense format validator. A small model judges whether the
+# main model's reply is clean Telegram-HTML output or broken/garbled. Cheap
+# heuristics (degenerate regex, ghost-preview, day-completeness guardrails)
+# catch known patterns; this catches anything novel that still looks wrong.
+# Output is binary "OK" / "BAD: <reason>" so parsing is trivial and the
+# small model has minimal room to drift.
+_FORMAT_CHECK_SYSTEM = (
+    "You are a strict format validator for a Telegram task-assistant. You"
+    " receive an assistant reply and must judge whether it is clean output"
+    " ready to send to the user.\n\n"
+    "Output EXACTLY one line, beginning with one of:\n"
+    "- \"OK\" — clean reply, ready to send.\n"
+    "- \"BAD: <one short reason>\" — broken; must be rewritten.\n\n"
+    "Mark a reply BAD if any of these are present:\n"
+    "- Ellipsis tokens (\"...\" or \"…\") used as truncation, mid-word"
+    " breaks, or appearing 3+ times in one reply.\n"
+    "- Self-coaching / meta language: \"the previous reply\", \"needs to"
+    " be\", \"should provide\", \"must use\", \"let me try\", \"the format"
+    " should\", \"correctly format\", or any text describing how the reply"
+    " ought to look.\n"
+    "- Repeated \"?\" or \"!\" tokens not part of normal punctuation.\n"
+    "- Garbled, partial, or non-prose noise; truncated bullets.\n"
+    "- Malformed Telegram HTML (unclosed or unknown tags).\n"
+    "- Mixed-language gibberish or untranslated scratch-pad text.\n\n"
+    "Mark a reply OK if it is natural Telegram-HTML output: bullets"
+    " prefixed \"•\", optional <b>day:</b> subheaders, complete prose."
+    " Single-line replies like \"Nothing.\" or \"Nothing for today.\" are"
+    " OK. Headings like \"Today:\" / \"Tomorrow:\" on their own line are"
+    " OK. Asking the user a clarifying question is OK.\n\n"
+    "Reply with nothing else. Just \"OK\" or \"BAD: <reason>\"."
+)
+
+
+def _check_format(
+    client: OpenAI,
+    model: str,
+    user_message: str,
+    reply: str,
+) -> str | None:
+    """Binary format validation by a small fast model.
+
+    Returns ``None`` if the reply is judged OK or if the validator itself
+    errors out (fail open — never block a legitimate reply on validator
+    flake). Returns a short feedback string when the reply is judged BAD,
+    so the caller can inject it as a system message and retry the main
+    model once.
+    """
+    try:
+        check_start = perf_counter()
+        response: Any = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": _FORMAT_CHECK_SYSTEM},
+                {
+                    "role": "user",
+                    "content": (
+                        f"User question:\n{user_message}\n\n"
+                        f"Assistant reply:\n{reply}\n\n"
+                        "Verdict:"
+                    ),
+                },
+            ],
+            max_completion_tokens=64,
+            temperature=0,
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning("format check call failed: %s", e)
+        return None
+
+    log.info(
+        "format check",
+        extra={"duration_ms": int((perf_counter() - check_start) * 1000)},
+    )
+
+    verdict = (response.choices[0].message.content or "").strip()
+    upper = verdict.upper()
+    if upper.startswith("OK"):
+        return None
+    if upper.startswith("BAD"):
+        reason = verdict.split(":", 1)[1].strip() if ":" in verdict else ""
+        return reason or "format judged BAD by validator"
+    log.warning("format check returned unparseable verdict: %r", verdict[:80])
+    return None
 
 
 # Matches a bold day-subheader the model produces in multi-day replies, e.g.
@@ -250,6 +382,8 @@ def run_agent(
     last_query_args: dict[str, Any] | None = None
     last_query_tasks: list[dict[str, Any]] | None = None
     guardrail_retry_done = False
+    ghost_preview_retry_done = False
+    format_check_retry_done = False
 
     for _iteration in range(max_iterations):
         api_start = perf_counter()
@@ -284,6 +418,35 @@ def run_agent(
             # them yet, inject feedback and continue the loop so the model
             # produces a corrected reply.
             if not msg.tool_calls:
+                # Ghost-preview defense: the model wrote a fake preview in
+                # chat instead of emitting the actual write tool. Feed back
+                # and force a retry so the user only ever sees the real
+                # system-generated preview.
+                if (
+                    not ghost_preview_retry_done
+                    and _looks_like_ghost_preview(reply)
+                ):
+                    log.warning("ghost preview detected; injecting feedback")
+                    ghost_preview_retry_done = True
+                    messages.append({"role": "assistant", "content": reply})
+                    messages.append(
+                        {
+                            "role": "system",
+                            "content": (
+                                "Your previous reply imitated the system's"
+                                " confirmation preview in chat (it contained"
+                                " 'Reply y to proceed'). The system shows"
+                                " that preview AUTOMATICALLY when you emit a"
+                                " write tool call. Do not write previews"
+                                " yourself. Emit the actual write tool call"
+                                " (create_tasks / update_tasks /"
+                                " complete_tasks / shift_due_dates) now,"
+                                " with no chat text alongside it."
+                            ),
+                        }
+                    )
+                    continue
+
                 if not guardrail_retry_done:
                     feedback = _check_guardrails(
                         reply, last_query_args, last_query_tasks
@@ -303,6 +466,44 @@ def run_agent(
                             }
                         )
                         continue
+
+                # Final line of defense: ask a small model to validate the
+                # reply's format. Catches novel garbled/leaked-thinking
+                # shapes the cheap regex checks above missed. Skipped if
+                # the format-check model is unset (env opt-out) or the
+                # reply is the placeholder for an empty model response.
+                if (
+                    not format_check_retry_done
+                    and s.llm_format_check_model
+                    and reply != "(empty reply)"
+                ):
+                    feedback = _check_format(
+                        client, s.llm_format_check_model, user_message, reply
+                    )
+                    if feedback:
+                        log.warning(
+                            "format check rejected reply; injecting feedback",
+                            extra={"reason": feedback[:80]},
+                        )
+                        format_check_retry_done = True
+                        messages.append({"role": "assistant", "content": reply})
+                        messages.append(
+                            {
+                                "role": "system",
+                                "content": (
+                                    "A format validator rejected your"
+                                    f" previous reply: {feedback}. Re-output"
+                                    " the answer in clean Telegram-HTML"
+                                    " format only — no ellipsis, no"
+                                    " meta-commentary, no scratch-pad text,"
+                                    " no descriptions of the format itself."
+                                    " Just produce the corrected reply"
+                                    " directly. Do not call any tools."
+                                ),
+                            }
+                        )
+                        continue
+
                 agent_messages.append({"role": "assistant", "content": reply})
                 return reply, agent_messages, None
 
