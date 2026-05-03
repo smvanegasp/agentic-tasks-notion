@@ -1,6 +1,8 @@
 from datetime import date, datetime, timedelta
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from agentic_tasks.agent.tools import call_tool
 from agentic_tasks.notion_io.tasks import Task
 
@@ -217,6 +219,70 @@ def test_create_tasks_rejects_empty_list():
     """Pydantic min_length=1 should keep the LLM from sending an empty batch."""
     result = call_tool("create_tasks", {"tasks": []})
     assert "error" in result.lower() or "Invalid" in result
+
+
+# ---- name normalization --------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        # All-lowercase names get a capitalized first letter.
+        ("buy markers", "Buy markers"),
+        ("going to the gym", "Going to the gym"),
+        # First letter character is uppercased even when it's not at index 0.
+        ("(test) buy milk", "(Test) buy milk"),
+        ("  trim me  ", "Trim me"),
+        # Already-mixed case is preserved verbatim — the user/model meant it.
+        ("HEA: Get a haircut", "HEA: Get a haircut"),
+        ("iPhone setup", "iPhone setup"),
+        ("Llamar a mamá", "Llamar a mamá"),
+        ("TRY TASK", "TRY TASK"),
+        # Non-letter content is left as-is.
+        ("123", "123"),
+        ("", ""),
+    ],
+)
+def test_normalize_task_name_rules(raw, expected):
+    from agentic_tasks.agent.tools import _normalize_task_name
+
+    assert _normalize_task_name(raw) == expected
+
+
+@patch("agentic_tasks.agent.tools.create_task")
+def test_create_tasks_normalizes_lowercase_name(mock_create):
+    """Lowercase-only names should reach Notion with a capitalized first
+    letter — the model often transcribes the user's casual typing
+    verbatim, and we want the stored task to look intentional."""
+    mock_create.return_value = _task("Buy markers")
+
+    call_tool("create_tasks", {"tasks": [{"name": "buy markers"}]})
+
+    assert mock_create.call_args.kwargs["name"] == "Buy markers"
+
+
+@patch("agentic_tasks.agent.tools.create_task")
+def test_create_tasks_preserves_intentional_casing(mock_create):
+    """Names with any uppercase letter pass through untouched."""
+    mock_create.return_value = _task("HEA: Get a haircut")
+
+    call_tool(
+        "create_tasks", {"tasks": [{"name": "HEA: Get a haircut"}]}
+    )
+
+    assert mock_create.call_args.kwargs["name"] == "HEA: Get a haircut"
+
+
+@patch("agentic_tasks.agent.tools.update_task")
+def test_update_tasks_normalizes_renamed_lowercase_name(mock_update):
+    mock_update.return_value = _task()
+
+    call_tool(
+        "update_tasks",
+        {"updates": [{"page_id": "p1", "name": "rename to lowercase"}]},
+    )
+
+    assert mock_update.call_args.kwargs["name"] == "Rename to lowercase"
 
 
 # ---- complete_tasks (batch) -----------------------------------------------

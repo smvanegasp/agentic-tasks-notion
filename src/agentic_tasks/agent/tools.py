@@ -20,7 +20,7 @@ from time import perf_counter
 from typing import Any, Literal
 
 from openai.types.chat import ChatCompletionFunctionToolParam
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator
 from rapidfuzz import fuzz, process
 
 from agentic_tasks.config import get_settings
@@ -41,6 +41,30 @@ _PRIORITY_RANK = {"High": 0, "Medium": 1, "Low": 2}
 
 StatusLiteral = Literal["To Do", "Doing", "Done"]
 PriorityLiteral = Literal["Low", "Medium", "High"]
+
+
+def _normalize_task_name(name: str) -> str:
+    """Tidy task names so they read intentionally rather than as raw
+    transcription.
+
+    Rule: if the name has at least one uppercase letter the user/model
+    capitalized something on purpose ("HEA: Get a haircut", "iPhone
+    setup", "Llamar a mamá") — leave it alone. Otherwise uppercase the
+    first letter character (skipping any leading punctuation or digits)
+    so "buy markers" → "Buy markers" and "(test) buy milk" → "(Test) buy
+    milk".
+    """
+    stripped = name.strip()
+    if not stripped:
+        return stripped
+    if any(c.isupper() for c in stripped):
+        return stripped
+    chars = list(stripped)
+    for i, c in enumerate(chars):
+        if c.isalpha():
+            chars[i] = c.upper()
+            return "".join(chars)
+    return stripped
 
 
 def _task_to_dict(t: Task) -> dict:
@@ -162,6 +186,11 @@ class NewTask(BaseModel):
     labels: list[str] | None = None
     my_day: bool = False
 
+    @field_validator("name")
+    @classmethod
+    def _tidy_name(cls, v: str) -> str:
+        return _normalize_task_name(v)
+
 
 class CreateTasksArgs(BaseModel):
     """Create one or more new tasks in a single batch.
@@ -186,6 +215,11 @@ class TaskUpdate(BaseModel):
     project_name: str | None = None
     labels: list[str] | None = None
     my_day: bool | None = None
+
+    @field_validator("name")
+    @classmethod
+    def _tidy_name(cls, v: str | None) -> str | None:
+        return _normalize_task_name(v) if v is not None else None
 
 
 class UpdateTasksArgs(BaseModel):

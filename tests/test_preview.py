@@ -72,6 +72,17 @@ def test_format_preview_create_basic():
     assert "<b>n</b>" in out
 
 
+def test_format_preview_create_tidies_lowercase_name():
+    """Lowercase-only names get capitalized in the preview itself (not just
+    on send-to-Notion) so what the user confirms matches what gets created."""
+    from agentic_tasks.agent.preview import format_preview
+
+    plan = [{"tool": "create_tasks", "arguments": {"tasks": [{"name": "buy markers"}]}}]
+    out = format_preview(plan)
+    assert "Buy markers" in out
+    assert "buy markers" not in out
+
+
 def test_format_preview_create_with_due_priority_project():
     from agentic_tasks.agent.preview import format_preview
 
@@ -101,15 +112,17 @@ def test_format_preview_create_with_due_priority_project():
 def test_format_preview_create_escapes_html_in_name():
     from agentic_tasks.agent.preview import format_preview
 
+    # Use uppercase tag so name normalization (lowercase-only -> capitalize)
+    # doesn't kick in and let this test stay focused on HTML escaping.
     plan = [
         {
             "tool": "create_tasks",
-            "arguments": {"tasks": [{"name": "<script>alert(1)</script>"}]},
+            "arguments": {"tasks": [{"name": "<SCRIPT>alert(1)</SCRIPT>"}]},
         }
     ]
     out = format_preview(plan)
-    assert "<script>" not in out
-    assert "&lt;script&gt;" in out
+    assert "<SCRIPT>" not in out
+    assert "&lt;SCRIPT&gt;" in out
 
 
 def test_format_preview_create_lists_each_task_in_batch():
